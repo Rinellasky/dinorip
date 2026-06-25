@@ -23,6 +23,15 @@ export interface WorkspaceImageState {
 export interface RipperState {
   id: string;
   points: [Vec2, Vec2, Vec2, Vec2];
+  // Per-edge cubic Bézier controls (see PolygonRipper.edgeCurves in core). Edge
+  // `i` runs from points[i] to points[(i+1)%4]; `null`/absent means a straight
+  // edge. Kept structurally compatible with PolygonRipper so a RipperState is
+  // passed straight through to the worker and GPU extraction.
+  edgeCurves?: (readonly [Vec2, Vec2] | null)[];
+  // Curved rippers extract as a shape-preserving cutout by default; this flag
+  // (toggled via the atlas right-click menu) can switch back to rectification.
+  // Ignored for straight rippers. See PolygonRipper.conserveShape in core.
+  conserveShape?: boolean;
   outputImageId?: string;
 }
 

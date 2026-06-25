@@ -4,8 +4,12 @@ import {
   colorNear,
   computeAtlasBounds,
   createRipper,
+  cubicBezier,
+  edgeControls,
   extractPerspective,
   findOwnerImageIndex,
+  ripperSurfacePoint,
+  shouldConserve,
   flipVertical,
   getPixel,
   imageFromRgba,
@@ -20,6 +24,7 @@ import {
   snapAtlasItem,
   setPixel
 } from "../src";
+import type { Vec2 } from "../src";
 
 describe("sampling", () => {
   it("bilinear samples y-up UVs from top-left row-major image data", () => {
@@ -65,6 +70,125 @@ describe("perspective extraction", () => {
     expect(result?.image.height).toBe(16);
     expect(getPixel(result!.image, 0, 0).g).toBeLessThan(getPixel(result!.image, 0, 15).g);
     expect(getPixel(result!.image, 15, 0).r).toBeGreaterThan(getPixel(result!.image, 0, 0).r);
+  });
+
+  it("defaults each edge's controls to its 1/3 and 2/3 points (straight)", () => {
+    const ripper = createRipper({ x: 0, y: 0 }, 6); // corners [tl, tr, br, bl]
+    const [c1, c2] = edgeControls(ripper, 0); // top edge tl -> tr
+    const tl = ripper.points[0];
+    const tr = ripper.points[1];
+    expect(c1.x).toBeCloseTo(tl.x + (tr.x - tl.x) / 3);
+    expect(c2.x).toBeCloseTo(tl.x + (2 * (tr.x - tl.x)) / 3);
+    expect(c1.y).toBeCloseTo(tl.y);
+  });
+
+  it("ripperSurfacePoint matches bilinear interpolation when all edges are straight", () => {
+    const ripper = createRipper({ x: 0, y: 0 }, 10);
+    const [tl, tr, br, bl] = ripper.points;
+    for (const [u, v] of [[0.25, 0.75], [0.5, 0.5], [0.9, 0.1]] as const) {
+      const top = { x: tl.x + (tr.x - tl.x) * u, y: tl.y + (tr.y - tl.y) * u };
+      const bottom = { x: bl.x + (br.x - bl.x) * u, y: bl.y + (br.y - bl.y) * u };
+      const expected = { x: bottom.x + (top.x - bottom.x) * v, y: bottom.y + (top.y - bottom.y) * v };
+      const actual = ripperSurfacePoint(ripper, u, v);
+      expect(actual.x).toBeCloseTo(expected.x);
+      expect(actual.y).toBeCloseTo(expected.y);
+    }
+  });
+
+  it("a curved edge bows the surface off the straight quad and follows the control", () => {
+    const ripper = createRipper({ x: 0, y: 0 }, 10);
+    const straightTopMid = ripperSurfacePoint(ripper, 0.5, 1); // on the top edge
+    // Bow the top edge (tl -> tr) outward in +y via its two cubic controls.
+    const [tl, tr] = ripper.points;
+    ripper.edgeCurves = [
+      [
+        { x: tl.x + (tr.x - tl.x) / 3, y: tl.y + 6 },
+        { x: tl.x + (2 * (tr.x - tl.x)) / 3, y: tl.y + 6 }
+      ],
+      null,
+      null,
+      null
+    ];
+    const curvedTopMid = ripperSurfacePoint(ripper, 0.5, 1);
+    expect(curvedTopMid.y).toBeGreaterThan(straightTopMid.y);
+    // The top edge at v=1 is exactly the cubic of edge 0, independent of the patch.
+    const [c1, c2] = edgeControls(ripper, 0);
+    const direct = cubicBezier(tl, c1, c2, tr, 0.5);
+    expect(curvedTopMid.x).toBeCloseTo(direct.x);
+    expect(curvedTopMid.y).toBeCloseTo(direct.y);
+  });
+
+  it("conserve mode masks pixels outside the curved outline (cutout), rectify fills them", () => {
+    const owner = { image: makeImage(20, 20, opaque(200, 100, 50)), position: { x: 0, y: 0 }, scale: { x: 1, y: 1 } };
+    // Diamond-ish ripper (corners at the cardinal points) with a mild outward
+    // bulge on every edge, so its bounding-box corners fall outside the shape.
+    const bulge = (a: { x: number; y: number }, b: { x: number; y: number }) => {
+      const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+      const out = { x: mid.x * 1.2, y: mid.y * 1.2 };
+      return [
+        { x: a.x + (out.x - a.x) * 0.5, y: a.y + (out.y - a.y) * 0.5 },
+        { x: b.x + (out.x - b.x) * 0.5, y: b.y + (out.y - b.y) * 0.5 }
+      ] as const;
+    };
+    const pts = [
+      { x: 0, y: 5 },
+      { x: 5, y: 0 },
+      { x: 0, y: -5 },
+      { x: -5, y: 0 }
+    ] as [{ x: number; y: number }, { x: number; y: number }, { x: number; y: number }, { x: number; y: number }];
+    const ripper = {
+      points: pts,
+      edgeCurves: [bulge(pts[0], pts[1]), bulge(pts[1], pts[2]), bulge(pts[2], pts[3]), bulge(pts[3], pts[0])],
+      conserveShape: true
+    };
+
+    expect(shouldConserve(ripper)).toBe(true);
+    const cut = extractPerspective(ripper, [owner]);
+    expect(cut).not.toBeNull();
+    const cx = Math.floor(cut!.image.width / 2);
+    const cy = Math.floor(cut!.image.height / 2);
+    expect(getPixel(cut!.image, 0, 0).a).toBe(0); // bbox corner: outside the curve
+    expect(getPixel(cut!.image, cx, cy).a).toBe(255); // centre: inside the shape
+
+    // Same ripper with conserve off rectifies: the corner pixel is now filled.
+    const flat = extractPerspective({ ...ripper, conserveShape: false }, [owner]);
+    expect(shouldConserve({ ...ripper, conserveShape: false })).toBe(false);
+    expect(getPixel(flat!.image, 0, 0).a).toBe(255);
+  });
+
+  it("conserve mode preserves vertical orientation (top stays top)", () => {
+    // Owner: top half red, bottom half green (row 0 is the top of the image).
+    const img = makeImage(10, 10);
+    for (let y = 0; y < 10; y += 1) {
+      for (let x = 0; x < 10; x += 1) {
+        setPixel(img, x, y, y < 5 ? opaque(255, 0, 0) : opaque(0, 255, 0));
+      }
+    }
+    const owner = { image: img, position: { x: 0, y: 0 }, scale: { x: 1, y: 1 } };
+    // Square ripper (corners ±4) with a curve only on the left/right edges, so the
+    // shape triggers conserve while the vertical extent stays the corners' ±4.
+    const ripper = {
+      points: [
+        { x: -4, y: 4 },
+        { x: 4, y: 4 },
+        { x: 4, y: -4 },
+        { x: -4, y: -4 }
+      ] as [Vec2, Vec2, Vec2, Vec2],
+      edgeCurves: [
+        null,
+        [{ x: 5, y: 2 }, { x: 5, y: -2 }] as const, // right edge bulges out in +x
+        null,
+        [{ x: -5, y: -2 }, { x: -5, y: 2 }] as const // left edge bulges out in -x
+      ],
+      conserveShape: true
+    };
+    const res = extractPerspective(ripper, [owner]);
+    expect(res).not.toBeNull();
+    const cx = Math.floor(res!.image.width / 2);
+    const topPixel = getPixel(res!.image, cx, 0); // top row should sample the red top half
+    const bottomPixel = getPixel(res!.image, cx, res!.image.height - 1); // bottom → green
+    expect(topPixel.r).toBeGreaterThan(topPixel.g);
+    expect(bottomPixel.g).toBeGreaterThan(bottomPixel.r);
   });
 
   it("selects the best owner image, including scaled and offset images", () => {

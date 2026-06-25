@@ -19,7 +19,14 @@
  *   - Textures are uploaded with straight (non-premultiplied) alpha so edge
  *     blending matches the CPU's independent per-channel lerp.
  */
-import { findOwnerImageIndex, inferExtractionSize } from "@dinorip/core";
+import {
+  edgeControls,
+  findOwnerImageIndex,
+  inferExtractionSize,
+  ripperBounds,
+  ripperOutlinePoints,
+  shouldConserve
+} from "@dinorip/core";
 import type { ExtractionResult, PixelImage, PlacedImage, PolygonRipper } from "@dinorip/core";
 
 const VERTEX_SHADER = `#version 300 es
@@ -41,13 +48,62 @@ uniform vec2 uTopLeft;
 uniform vec2 uTopRight;
 uniform vec2 uBottomRight;
 uniform vec2 uBottomLeft;
+// Per-edge cubic control points (2 per edge). Default to the 1/3 and 2/3
+// points of each straight edge, which makes the cubic exactly linear, so an
+// uncurved ripper renders identically to the old bilinear quad.
+uniform vec2 uTop1;     uniform vec2 uTop2;     // edge 0: tl -> tr
+uniform vec2 uRight1;   uniform vec2 uRight2;   // edge 1: tr -> br
+uniform vec2 uBottom1;  uniform vec2 uBottom2;  // edge 2: br -> bl
+uniform vec2 uLeft1;    uniform vec2 uLeft2;    // edge 3: bl -> tl
 uniform vec2 uOwnerPos;
 uniform vec2 uScale;
 uniform vec2 uImgSize;
+// Conserve (shape-preserving cutout) mode: sample the source over the outline's
+// world bounding box and zero alpha outside the flattened outline polygon.
+uniform int uConserve;          // 0 = rectify (Coons), 1 = conserve cutout
+uniform vec4 uBBox;             // (xMin, yMin, xMax, yMax)
+uniform vec2 uOutline[32];      // flattened outline (world space)
+uniform int uOutlineCount;
+vec2 cubic(vec2 p0, vec2 c1, vec2 c2, vec2 p3, float t) {
+  float mt = 1.0 - t;
+  return mt*mt*mt*p0 + 3.0*mt*mt*t*c1 + 3.0*mt*t*t*c2 + t*t*t*p3;
+}
+// Even-odd point-in-polygon, matching the CPU pointInsidePolygon exactly.
+bool insideOutline(vec2 p) {
+  bool inside = false;
+  vec2 prev = uOutline[uOutlineCount - 1];
+  for (int i = 0; i < 32; i++) {
+    if (i >= uOutlineCount) break;
+    vec2 cur = uOutline[i];
+    if (((cur.y > p.y) != (prev.y > p.y)) &&
+        (p.x < (prev.x - cur.x) * (p.y - cur.y) / (prev.y - cur.y) + cur.x)) {
+      inside = !inside;
+    }
+    prev = cur;
+  }
+  return inside;
+}
 void main() {
-  vec2 top = mix(uTopLeft, uTopRight, vUV.x);
-  vec2 bottom = mix(uBottomLeft, uBottomRight, vUV.x);
-  vec2 p = mix(bottom, top, vUV.y);
+  float u = vUV.x;
+  float v = vUV.y;
+  vec2 p;
+  if (uConserve == 1) {
+    // Identity mapping over the world bounding box (no rectification). v=1 is the
+    // top row (same convention as the rectify branch, where v=1 selects uTopLeft/
+    // uTopRight), so it maps to yMax (uBBox.w) — matching the CPU conserve path
+    // (worldY = yMax - ty*(yMax-yMin)). Do NOT swap these or the cutout flips.
+    p = vec2(mix(uBBox.x, uBBox.z, u), mix(uBBox.y, uBBox.w, v));
+  } else {
+    // Coons patch bounded by the four cubic edges (matches the CPU ripperSurfacePoint).
+    vec2 top = cubic(uTopLeft, uTop1, uTop2, uTopRight, u);          // T(u)
+    vec2 bottom = cubic(uBottomRight, uBottom1, uBottom2, uBottomLeft, 1.0 - u); // B(u)
+    vec2 left = cubic(uBottomLeft, uLeft1, uLeft2, uTopLeft, v);     // L(v)
+    vec2 right = cubic(uTopRight, uRight1, uRight2, uBottomRight, 1.0 - v); // R(v)
+    float mu = 1.0 - u;
+    float mv = 1.0 - v;
+    vec2 corners = mu*mv*uBottomLeft + u*mv*uBottomRight + mu*v*uTopLeft + u*v*uTopRight;
+    p = mv*bottom + v*top + mu*left + u*right - corners;
+  }
   float localX = (p.x - uOwnerPos.x) / uScale.x;
   float localY = (p.y - uOwnerPos.y) / uScale.y;
   float su = clamp(localX / uImgSize.x + 0.5, 0.0, 1.0);
@@ -55,7 +111,9 @@ void main() {
   // Match the CPU sampleBilinear mapping (x = u*(w-1)) under GPU LINEAR filtering.
   float tx = (su * (uImgSize.x - 1.0) + 0.5) / uImgSize.x;
   float ty = ((1.0 - sv) * (uImgSize.y - 1.0) + 0.5) / uImgSize.y;
-  fragColor = texture(uSource, vec2(tx, ty));
+  vec4 color = texture(uSource, vec2(tx, ty));
+  if (uConserve == 1 && !insideOutline(p)) color = vec4(0.0);
+  fragColor = color;
 }`;
 
 // Two triangles covering the output framebuffer. Each vertex carries the CPU
@@ -148,6 +206,18 @@ function init(): GpuContext | null {
       "uTopRight",
       "uBottomRight",
       "uBottomLeft",
+      "uTop1",
+      "uTop2",
+      "uRight1",
+      "uRight2",
+      "uBottom1",
+      "uBottom2",
+      "uLeft1",
+      "uLeft2",
+      "uConserve",
+      "uBBox",
+      "uOutline",
+      "uOutlineCount",
       "uOwnerPos",
       "uScale",
       "uImgSize",
@@ -239,6 +309,11 @@ function drawWarp(
 ): void {
   const { gl } = ctx;
   const [topLeft, topRight, bottomRight, bottomLeft] = ripper.points;
+  // Cubic controls for each edge, defaulting to the 1/3-2/3 straight-line points.
+  const [top1, top2] = edgeControls(ripper, 0);
+  const [right1, right2] = edgeControls(ripper, 1);
+  const [bottom1, bottom2] = edgeControls(ripper, 2);
+  const [left1, left2] = edgeControls(ripper, 3);
   const scaleX = owner.scale.x === 0 ? 1 : owner.scale.x;
   const scaleY = owner.scale.y === 0 ? 1 : owner.scale.y;
   const sourceTexture = uploadSource(ctx, owner.image);
@@ -253,6 +328,32 @@ function drawWarp(
   gl.uniform2f(u.uTopRight ?? null, topRight.x, topRight.y);
   gl.uniform2f(u.uBottomRight ?? null, bottomRight.x, bottomRight.y);
   gl.uniform2f(u.uBottomLeft ?? null, bottomLeft.x, bottomLeft.y);
+  gl.uniform2f(u.uTop1 ?? null, top1.x, top1.y);
+  gl.uniform2f(u.uTop2 ?? null, top2.x, top2.y);
+  gl.uniform2f(u.uRight1 ?? null, right1.x, right1.y);
+  gl.uniform2f(u.uRight2 ?? null, right2.x, right2.y);
+  gl.uniform2f(u.uBottom1 ?? null, bottom1.x, bottom1.y);
+  gl.uniform2f(u.uBottom2 ?? null, bottom2.x, bottom2.y);
+  gl.uniform2f(u.uLeft1 ?? null, left1.x, left1.y);
+  gl.uniform2f(u.uLeft2 ?? null, left2.x, left2.y);
+
+  // Conserve (shape-preserving cutout) mode: feed the outline polygon + bbox so
+  // the fragment shader samples in place and masks outside the curve.
+  const conserve = shouldConserve(ripper);
+  gl.uniform1i(u.uConserve ?? null, conserve ? 1 : 0);
+  if (conserve) {
+    const { xMin, xMax, yMin, yMax } = ripperBounds(ripper);
+    const outline = ripperOutlinePoints(ripper);
+    const flat = new Float32Array(outline.length * 2);
+    outline.forEach((point, index) => {
+      flat[index * 2] = point.x;
+      flat[index * 2 + 1] = point.y;
+    });
+    gl.uniform4f(u.uBBox ?? null, xMin, yMin, xMax, yMax);
+    gl.uniform2fv(u.uOutline ?? null, flat);
+    gl.uniform1i(u.uOutlineCount ?? null, outline.length);
+  }
+
   gl.uniform2f(u.uOwnerPos ?? null, owner.position.x, owner.position.y);
   gl.uniform2f(u.uScale ?? null, scaleX, scaleY);
   gl.uniform2f(u.uImgSize ?? null, owner.image.width, owner.image.height);

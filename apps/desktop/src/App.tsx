@@ -6,8 +6,10 @@ import {
   createRipper,
   flipVertical,
   getPixel,
+  isRipperCurved,
   makeImage,
-  setPixel
+  setPixel,
+  shouldConserve
 } from "@dinorip/core";
 import type {
   AtlasItem,
@@ -64,6 +66,8 @@ export function App(): ReactElement {
   const [selectedSourceImageId, setSelectedSourceImageId] = useState<string | undefined>();
   const [selectedAtlasImageId, setSelectedAtlasImageId] = useState<string | undefined>();
   const [selectedRipperId, setSelectedRipperId] = useState<string | undefined>();
+  // Atlas right-click context menu (curve conserve/rectify toggle). Null = closed.
+  const [ripperMenu, setRipperMenu] = useState<{ ripperId: string; x: number; y: number } | null>(null);
   // Atlas export sizing: a manual minimum size (null = auto-fit to content) and
   // whether the export region is padded to a square.
   const [atlasManualSize, setAtlasManualSize] = useState<{ width: number; height: number } | null>(null);
@@ -803,7 +807,18 @@ export function App(): ReactElement {
 
   function moveRipper(id: string, delta: Vec2) {
     setRippers((current) => current.map((ripper) => ripper.id === id
-      ? { ...ripper, points: ripper.points.map((point) => ({ x: point.x + delta.x, y: point.y + delta.y })) as RipperState["points"] }
+      ? {
+          ...ripper,
+          points: ripper.points.map((point) => ({ x: point.x + delta.x, y: point.y + delta.y })) as RipperState["points"],
+          // Translate the curve control points too, so curved edges move with the
+          // body instead of being left behind.
+          edgeCurves: ripper.edgeCurves?.map((curve) => curve
+            ? [
+                { x: curve[0].x + delta.x, y: curve[0].y + delta.y },
+                { x: curve[1].x + delta.x, y: curve[1].y + delta.y }
+              ] as const
+            : null)
+        }
       : ripper));
   }
 
@@ -827,6 +842,53 @@ export function App(): ReactElement {
       for (const update of mine) points[update.index] = update.point;
       return { ...ripper, points };
     }));
+  }
+
+  // Set (or replace) the cubic controls of one ripper edge. Used live while
+  // creating a curve (Cmd-drag on an edge) or dragging a curve handle; the
+  // surrounding onRipperEditStart/End calls handle the undo step and re-extract.
+  function setEdgeCurve(id: string, edge: number, controls: readonly [Vec2, Vec2]) {
+    setRippers((current) => current.map((ripper) => {
+      if (ripper.id !== id) return ripper;
+      const edgeCurves = [...(ripper.edgeCurves ?? [null, null, null, null])];
+      edgeCurves[edge] = controls;
+      return { ...ripper, edgeCurves };
+    }));
+  }
+
+  // Remove an edge's curve (double-click a curve handle): the edge snaps straight.
+  // A discrete undoable action, so it records history itself; the extraction
+  // effect re-bakes automatically when the signature changes.
+  function removeEdgeCurve(id: string, edge: number) {
+    const target = rippers.find((ripper) => ripper.id === id);
+    if (!target?.edgeCurves?.[edge]) return;
+    commitHistory();
+    setRippers((current) => current.map((ripper) => {
+      if (ripper.id !== id) return ripper;
+      const edgeCurves = [...(ripper.edgeCurves ?? [null, null, null, null])];
+      edgeCurves[edge] = null;
+      return { ...ripper, edgeCurves };
+    }));
+  }
+
+  // Flip a curved ripper between conserve (shape-preserving cutout) and rectify.
+  // Discrete undoable action; the extraction effect re-bakes on signature change.
+  function toggleConserveShape(ripperId: string) {
+    const target = rippers.find((ripper) => ripper.id === ripperId);
+    if (!target || !isRipperCurved(target)) return;
+    commitHistory();
+    setRippers((current) => current.map((ripper) =>
+      ripper.id === ripperId ? { ...ripper, conserveShape: !(ripper.conserveShape ?? true) } : ripper));
+  }
+
+  // Right-click on an atlas texture: if it belongs to a curved ripper, open the
+  // context menu offering the conserve/rectify toggle. Straight rippers have no
+  // menu (they are always rectified).
+  function onAtlasImageContextMenu(imageId: string | undefined, clientX: number, clientY: number) {
+    if (!imageId) return setRipperMenu(null);
+    const ripper = rippers.find((item) => item.outputImageId === imageId);
+    if (!ripper || !isRipperCurved(ripper)) return setRipperMenu(null);
+    setRipperMenu({ ripperId: ripper.id, x: clientX, y: clientY });
   }
 
   function onRipperEditStart(id: string) {
@@ -944,6 +1006,8 @@ export function App(): ReactElement {
               onMoveRipper={moveRipper}
               onMoveVertex={moveVertex}
               onMoveVertices={moveVertices}
+              onSetEdgeCurve={setEdgeCurve}
+              onRemoveEdgeCurve={removeEdgeCurve}
               onRipperEditStart={onRipperEditStart}
               onRipperEditEnd={onRipperEditEnd}
               onImageEditStart={onImageEditStart}
@@ -979,6 +1043,7 @@ export function App(): ReactElement {
               onSelectImage={setSelectedAtlasImageId}
               onMoveImage={moveAtlasImage}
               onScaleImage={scaleAtlasImage}
+              onImageContextMenu={onAtlasImageContextMenu}
               onImageEditStart={onImageEditStart}
               onImageEditEnd={onImageEditEnd}
             />
@@ -1041,6 +1106,28 @@ export function App(): ReactElement {
           />
         )}
       </div>
+      {ripperMenu && (() => {
+        const menuRipper = rippers.find((item) => item.id === ripperMenu.ripperId);
+        if (!menuRipper) return null;
+        const conserving = shouldConserve(menuRipper);
+        return (
+          <>
+            <div className="context-menu__backdrop" onPointerDown={() => setRipperMenu(null)} onContextMenu={(event) => { event.preventDefault(); setRipperMenu(null); }} />
+            <ul className="context-menu" style={{ left: ripperMenu.x, top: ripperMenu.y }} role="menu" aria-label="Ripper options">
+              <li role="none">
+                <button
+                  type="button"
+                  role="menuitemcheckbox"
+                  aria-checked={conserving}
+                  onClick={() => { toggleConserveShape(ripperMenu.ripperId); setRipperMenu(null); }}
+                >
+                  {conserving ? "✓ " : " "}Preserve curved shape
+                </button>
+              </li>
+            </ul>
+          </>
+        );
+      })()}
     </main>
   );
 }
@@ -1217,7 +1304,18 @@ function snapshotSignature(state: HistorySnapshot): string {
 function ripperSignature(ripper: RipperState): string {
   return [
     ripper.id,
-    ...ripper.points.flatMap((point) => [formatNumber(point.x), formatNumber(point.y)])
+    ...ripper.points.flatMap((point) => [formatNumber(point.x), formatNumber(point.y)]),
+    // Fold in per-edge curve controls so curve create/move/remove re-extracts and
+    // registers as a real change for undo detection. "_" marks a straight edge.
+    ...[0, 1, 2, 3].map((edge) => {
+      const curve = ripper.edgeCurves?.[edge];
+      return curve
+        ? `${formatNumber(curve[0].x)},${formatNumber(curve[0].y)},${formatNumber(curve[1].x)},${formatNumber(curve[1].y)}`
+        : "_";
+    }),
+    // Conserve toggle changes extraction output, so it must re-extract / count as
+    // a change. Default-on for curved rippers (see core shouldConserve).
+    `c${ripper.conserveShape === false ? "0" : "1"}`
   ].join(":");
 }
 

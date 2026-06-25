@@ -1377,3 +1377,46 @@ svg {
     grid-template-columns: repeat(6, 24px) minmax(72px, 1fr);
   }
 }
+
+/* Right-click context menu (atlas curve conserve/rectify toggle). */
+.context-menu__backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+}
+
+.context-menu {
+  position: fixed;
+  z-index: 41;
+  margin: 0;
+  padding: 3px;
+  list-style: none;
+  min-width: 168px;
+  background: var(--panel-dark);
+  border: 2px solid var(--black);
+  box-shadow: inset 1px 1px 0 #5c5e54, 3px 3px 0 rgba(8, 9, 8, 0.5);
+  font-family: var(--pixel-font);
+  font-size: 10px;
+}
+
+.context-menu li {
+  margin: 0;
+}
+
+.context-menu button {
+  width: 100%;
+  text-align: left;
+  padding: 6px 8px;
+  background: transparent;
+  border: none;
+  color: var(--ink);
+  font-family: inherit;
+  font-size: inherit;
+  cursor: pointer;
+  white-space: pre;
+}
+
+.context-menu button:hover {
+  background: var(--accent-2);
+  color: var(--black);
+}

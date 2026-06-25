@@ -8,7 +8,7 @@ import {
   VIEWPORT_MIN_ZOOM,
   VIEWPORT_ZOOM_SPEED
 } from "@dinorip/ipc-contracts";
-import { pointInsidePolygon, snapAtlasItem } from "@dinorip/core";
+import { edgeControls, pointInsidePolygon, ripperOutlinePoints, snapAtlasItem } from "@dinorip/core";
 import type { AtlasItem, Vec2 } from "@dinorip/core";
 import type { RipperState, ViewState, WorkspaceImageState, WorkspaceKind } from "../renderer/types";
 import { pixelImageToCanvas } from "../renderer/imageCanvas";
@@ -62,6 +62,12 @@ interface CanvasWorkspaceProps {
   onMoveVertex?(id: string, index: number, point: Vec2): void;
   /** Batched corner move — used for group drags and Cmd-uniform-scaling. */
   onMoveVertices?(updates: VertexUpdate[]): void;
+  /** Set (or replace) one edge's cubic Bézier controls — curve create + handle drag. */
+  onSetEdgeCurve?(id: string, edge: number, controls: readonly [Vec2, Vec2]): void;
+  /** Clear one edge's curve (snap straight) — double-click a curve handle. */
+  onRemoveEdgeCurve?(id: string, edge: number): void;
+  /** Right-click on an image (atlas): reports the image under the cursor (or undefined). */
+  onImageContextMenu?(id: string | undefined, clientX: number, clientY: number): void;
   onRipperEditStart?(id: string): void;
   onRipperEditEnd?(): void;
   onImageEditStart?(id: string): void;
@@ -96,7 +102,14 @@ type DragState =
   // so Cmd-scaling and group moves can be recomputed from a stable baseline
   // (letting Cmd be toggled mid-drag). `group` is every corner that moves with
   // this one (just the grabbed corner unless a multi-selection is active).
-  | { type: "vertex"; id: string; index: number; startWorld: Vec2; startPoints: Record<string, Vec2[]>; group: VertexRef[] }
+  | { type: "vertex"; id: string; index: number; startWorld: Vec2; startPoints: Record<string, Vec2[]>; startCurves?: (readonly [Vec2, Vec2] | null)[]; group: VertexRef[] }
+  // Bending a straight edge into a curve: Cmd-drag from the edge. `p0`/`p3` are
+  // the edge's endpoints (corners) captured at grab time; each move derives the
+  // two cubic controls from a quadratic passing through the pointer.
+  | { type: "createCurve"; id: string; edge: number; p0: Vec2; p3: Vec2 }
+  // Dragging one of an edge's two cubic control handles. `other` is the sibling
+  // control, held fixed; `which` is 0 (near edge start) or 1 (near edge end).
+  | { type: "curveHandle"; id: string; edge: number; which: 0 | 1; other: Vec2 }
   // Rubber-band box that selects the ripper corners inside it on release.
   | { type: "marquee" };
 
@@ -104,6 +117,11 @@ const HANDLE_SCREEN_SIZE = 8;
 const HANDLE_HIT_RADIUS = 9;
 const VERTEX_HANDLE_SIZE = 7;
 const VERTEX_HANDLE_SELECTED_SIZE = 10;
+// Curve control handles are drawn as small circles, distinct from corner squares.
+const CURVE_HANDLE_RADIUS = 5;
+// Screen-space pickup distance (world = / zoom) for curve handles and edges.
+const CURVE_HANDLE_HIT_PX = 9;
+const EDGE_HIT_PX = 7;
 
 export function CanvasWorkspace(props: CanvasWorkspaceProps): ReactElement {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -139,7 +157,7 @@ export function CanvasWorkspace(props: CanvasWorkspaceProps): ReactElement {
     return () => cancelAnimationFrame(animation);
   }, [props, rippers, selectedImage, selectedVertices]);
 
-  const toWorld = (event: React.PointerEvent<HTMLCanvasElement> | React.WheelEvent<HTMLCanvasElement>): Vec2 => {
+  const toWorld = (event: React.MouseEvent<HTMLCanvasElement> | React.WheelEvent<HTMLCanvasElement>): Vec2 => {
     const canvas = canvasRef.current!;
     const rect = canvas.getBoundingClientRect();
     const x = event.clientX - rect.left;
@@ -202,11 +220,51 @@ export function CanvasWorkspace(props: CanvasWorkspaceProps): ReactElement {
         index: vertexHit.index,
         startWorld: world,
         startPoints: snapshotPoints(rippers, group, vertexHit.ripper.id),
+        // Snapshot the dragged ripper's curve controls so Cmd-scaling transforms
+        // them from a stable baseline alongside the corners.
+        startCurves: vertexHit.ripper.edgeCurves?.map((curve) =>
+          curve ? ([{ ...curve[0] }, { ...curve[1] }] as const) : null),
         group
       };
       props.onRipperEditStart?.(vertexHit.ripper.id);
       setCanvasCursor(canvas, "pointer");
       return;
+    }
+
+    // Dragging an existing curve handle (the small circles on a curved edge).
+    // No modifier needed; corners are hit-tested first so this never shadows them.
+    const curveHit = hitCurveHandle(world, rippers, props.view.zoom, props.selectedRipperId);
+    if (curveHit && props.onSetEdgeCurve && props.onSelectRipper) {
+      props.onSelectRipper(curveHit.ripper.id);
+      if (selectedVertices.size > 0) setSelectedVertices(new Set());
+      const controls = edgeControls(curveHit.ripper, curveHit.edge);
+      dragRef.current = {
+        type: "curveHandle",
+        id: curveHit.ripper.id,
+        edge: curveHit.edge,
+        which: curveHit.which,
+        other: controls[curveHit.which === 0 ? 1 : 0]
+      };
+      props.onRipperEditStart?.(curveHit.ripper.id);
+      setCanvasCursor(canvas, "pointer");
+      return;
+    }
+
+    // Cmd/Ctrl over a straight edge bends it into a curve: create the control on
+    // press and drag it. Curved edges are excluded (they already show handles).
+    if ((event.metaKey || event.ctrlKey) && props.onSetEdgeCurve && props.onSelectRipper) {
+      const edgeHit = hitEdge(world, rippers, props.view.zoom);
+      if (edgeHit) {
+        props.onSelectRipper(edgeHit.ripper.id);
+        if (selectedVertices.size > 0) setSelectedVertices(new Set());
+        const p0 = edgeHit.ripper.points[edgeHit.edge]!;
+        const p3 = edgeHit.ripper.points[(edgeHit.edge + 1) % 4]!;
+        dragRef.current = { type: "createCurve", id: edgeHit.ripper.id, edge: edgeHit.edge, p0, p3 };
+        props.onRipperEditStart?.(edgeHit.ripper.id);
+        props.onSetEdgeCurve(edgeHit.ripper.id, edgeHit.edge, quadraticToCubic(p0, p3, world));
+        setCanvasCursor(canvas, "pointer");
+        return;
+      }
     }
 
     const ripperHit = hitRipper(world, rippers);
@@ -275,6 +333,30 @@ export function CanvasWorkspace(props: CanvasWorkspaceProps): ReactElement {
       const updates = computeVertexUpdates(drag, world, scaleMode);
       if (props.onMoveVertices) props.onMoveVertices(updates);
       else if (props.onMoveVertex) for (const update of updates) props.onMoveVertex(update.id, update.index, update.point);
+      // Cmd-scale the curve controls through the same transform so curved edges
+      // stretch with the shape instead of staying put. (React batches these
+      // setRippers calls with the corner update above into one render.)
+      if (scaleMode && drag.startCurves && props.onSetEdgeCurve) {
+        const start = drag.startPoints[drag.id];
+        const transform = start && start.length === 4 ? scaleTransform(start, drag.index, world) : null;
+        if (transform) {
+          drag.startCurves.forEach((curve, edge) => {
+            if (curve) props.onSetEdgeCurve!(drag.id, edge, [transform(curve[0]), transform(curve[1])]);
+          });
+        }
+      }
+      return;
+    }
+
+    if (drag.type === "createCurve" && props.onSetEdgeCurve) {
+      props.onSetEdgeCurve(drag.id, drag.edge, quadraticToCubic(drag.p0, drag.p3, toWorld(event)));
+      return;
+    }
+
+    if (drag.type === "curveHandle" && props.onSetEdgeCurve) {
+      const world = toWorld(event);
+      const controls: [Vec2, Vec2] = drag.which === 0 ? [world, drag.other] : [drag.other, world];
+      props.onSetEdgeCurve(drag.id, drag.edge, controls);
       return;
     }
 
@@ -325,7 +407,24 @@ export function CanvasWorkspace(props: CanvasWorkspaceProps): ReactElement {
       }
     }
 
-    updateHoverCursor(canvas, toWorld(event), props.images, rippers, props.view.zoom, props.kind);
+    updateHoverCursor(canvas, toWorld(event), props.images, rippers, props.view.zoom, props.kind, event.metaKey || event.ctrlKey, props.selectedRipperId);
+  };
+
+  const onContextMenu = (event: React.MouseEvent<HTMLCanvasElement>) => {
+    event.preventDefault();
+    if (!props.onImageContextMenu) return;
+    const hit = hitImage(toWorld(event), props.images);
+    props.onImageContextMenu(hit?.id, event.clientX, event.clientY);
+  };
+
+  const onDoubleClick = (event: React.MouseEvent<HTMLCanvasElement>) => {
+    if (!props.onRemoveEdgeCurve) return;
+    const world = toWorld(event);
+    const curveHit = hitCurveHandle(world, rippers, props.view.zoom, props.selectedRipperId);
+    if (curveHit) {
+      props.onRemoveEdgeCurve(curveHit.ripper.id, curveHit.edge);
+      dragRef.current = { type: "none" };
+    }
   };
 
   const endDrag = () => {
@@ -341,7 +440,8 @@ export function CanvasWorkspace(props: CanvasWorkspaceProps): ReactElement {
       return;
     }
 
-    const wasEditingRipper = drag.type === "vertex" || drag.type === "ripper";
+    const wasEditingRipper =
+      drag.type === "vertex" || drag.type === "ripper" || drag.type === "createCurve" || drag.type === "curveHandle";
     const wasEditingImage = drag.type === "image" || drag.type === "resize";
     dragRef.current = { type: "none" };
     if (canvas) setCanvasCursor(canvas, "grab");
@@ -387,8 +487,9 @@ export function CanvasWorkspace(props: CanvasWorkspaceProps): ReactElement {
         onPointerMove={onPointerMove}
         onPointerUp={endDrag}
         onPointerCancel={endDrag}
+        onDoubleClick={onDoubleClick}
         onWheel={onWheel}
-        onContextMenu={(event) => event.preventDefault()}
+        onContextMenu={onContextMenu}
       />
     </section>
   );
@@ -539,20 +640,25 @@ function drawRipper(
 
   ctx.globalAlpha = selected ? 1 : 0.45;
 
+  // Screen-space cubic controls for each edge (defaults give straight segments).
+  const controls = [0, 1, 2, 3].map((edge) =>
+    edgeControls(ripper, edge).map((c) => worldToScreen(c, canvas, view)) as [Vec2, Vec2]
+  );
+
   // A thin dark base underneath keeps the dashes legible over any background.
   // Vertex dragging works via geometric hit-testing (hitVertex), independent of
   // whether the handles below are drawn.
   ctx.lineWidth = selected ? 2 : 1.5;
   ctx.strokeStyle = "rgba(8, 9, 8, 0.85)";
   ctx.setLineDash([]);
-  closedPath(ctx, points);
+  ripperBezierPath(ctx, points, controls);
   ctx.stroke();
 
   ctx.lineWidth = selected ? 1.5 : 1;
   ctx.strokeStyle = selected ? "#efe5c7" : "#9b968a";
   ctx.setLineDash([6, 5]);
   ctx.lineDashOffset = selected ? -(time / 40) : 0;
-  closedPath(ctx, points);
+  ripperBezierPath(ctx, points, controls);
   ctx.stroke();
   ctx.setLineDash([]);
 
@@ -573,6 +679,33 @@ function drawRipper(
     ctx.strokeStyle = "rgba(8, 9, 8, 0.85)";
     ctx.strokeRect(x + 0.5, y + 0.5, size - 1, size - 1);
   });
+
+  // Curve control handles (only on curved edges, on the selected ripper): two
+  // small circles per edge, each tethered to its anchor corner by a guide line —
+  // the familiar Bézier-handle look that signals "drag me to shape the curve".
+  if (selected && ripper.edgeCurves) {
+    for (let edge = 0; edge < 4; edge += 1) {
+      if (!ripper.edgeCurves[edge]) continue;
+      const [c1, c2] = controls[edge]!;
+      const anchors = [points[edge]!, points[(edge + 1) % 4]!];
+      [c1, c2].forEach((handle, which) => {
+        const anchor = anchors[which]!;
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = "rgba(239, 229, 199, 0.5)";
+        ctx.beginPath();
+        ctx.moveTo(anchor.x, anchor.y);
+        ctx.lineTo(handle.x, handle.y);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(handle.x, handle.y, CURVE_HANDLE_RADIUS, 0, Math.PI * 2);
+        ctx.fillStyle = "#efe5c7";
+        ctx.fill();
+        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = "rgba(8, 9, 8, 0.85)";
+        ctx.stroke();
+      });
+    }
+  }
 
   ctx.restore();
 }
@@ -756,6 +889,36 @@ function snapshotPoints(rippers: RipperState[], group: VertexRef[], draggedId: s
   return out;
 }
 
+// The Cmd-scale transform as a function applied to ANY world point. Pins the
+// opposite corner and scales independently along the quad's two edge directions
+// (A, B) out of that corner, so the grabbed corner follows the pointer and the
+// whole shape — corners and curve controls alike — stretches consistently.
+// Returns null when the start quad is degenerate. `start` is the 4 corner
+// snapshot, `index` the grabbed corner, `world` the pointer.
+function scaleTransform(start: Vec2[], index: number, world: Vec2): ((p: Vec2) => Vec2) | null {
+  const anchor = start[(index + 2) % 4];
+  const sideA = start[(index + 1) % 4]; // adjacent corner along edge A
+  const sideB = start[(index + 3) % 4]; // adjacent corner along edge B
+  if (!anchor || !sideA || !sideB) return null;
+  const ax = sideA.x - anchor.x, ay = sideA.y - anchor.y;
+  const bx = sideB.x - anchor.x, by = sideB.y - anchor.y;
+  const det = ax * by - ay * bx;
+  if (Math.abs(det) <= 1e-6) return null;
+  const wx = world.x - anchor.x, wy = world.y - anchor.y;
+  const s = (wx * by - wy * bx) / det; // scale along edge A
+  const t = (ax * wy - ay * wx) / det; // scale along edge B
+  return (p: Vec2): Vec2 => {
+    // Decompose p-anchor onto the (A, B) basis, scale each coordinate, recompose.
+    const px = p.x - anchor.x, py = p.y - anchor.y;
+    const alpha = (px * by - py * bx) / det;
+    const beta = (ax * py - ay * px) / det;
+    return {
+      x: anchor.x + alpha * s * ax + beta * t * bx,
+      y: anchor.y + alpha * s * ay + beta * t * by
+    };
+  };
+}
+
 // Resolve a corner drag to the set of corner moves it implies.
 //   Cmd/Ctrl → pin the opposite corner and stretch the quad to the pointer,
 //              scaling independently along each of the quad's two edge
@@ -771,27 +934,11 @@ function computeVertexUpdates(
 ): VertexUpdate[] {
   if (scaleMode) {
     const start = drag.startPoints[drag.id];
-    if (start && start.length === 4) {
-      const anchor = start[(drag.index + 2) % 4]!;
-      const sideA = start[(drag.index + 1) % 4]!; // adjacent corner along edge A
-      const sideB = start[(drag.index + 3) % 4]!; // adjacent corner along edge B
-      // Edge vectors out of the pinned corner. The grabbed corner sits at
-      // anchor + A + B; decompose the pointer offset onto (A, B) so each edge
-      // scales on its own, then place the adjacent corners along each edge.
-      const ax = sideA.x - anchor.x, ay = sideA.y - anchor.y;
-      const bx = sideB.x - anchor.x, by = sideB.y - anchor.y;
-      const det = ax * by - ay * bx;
-      if (Math.abs(det) > 1e-6) {
-        const wx = world.x - anchor.x, wy = world.y - anchor.y;
-        const s = (wx * by - wy * bx) / det; // scale along edge A
-        const t = (ax * wy - ay * wx) / det; // scale along edge B
-        const updates: VertexUpdate[] = [];
-        updates[drag.index] = { id: drag.id, index: drag.index, point: world };
-        updates[(drag.index + 1) % 4] = { id: drag.id, index: (drag.index + 1) % 4, point: { x: anchor.x + ax * s, y: anchor.y + ay * s } };
-        updates[(drag.index + 2) % 4] = { id: drag.id, index: (drag.index + 2) % 4, point: anchor };
-        updates[(drag.index + 3) % 4] = { id: drag.id, index: (drag.index + 3) % 4, point: { x: anchor.x + bx * t, y: anchor.y + by * t } };
-        return updates;
-      }
+    const transform = start && start.length === 4 ? scaleTransform(start, drag.index, world) : null;
+    if (start && transform) {
+      const updates: VertexUpdate[] = [];
+      for (let i = 0; i < 4; i += 1) updates[i] = { id: drag.id, index: i, point: transform(start[i]!) };
+      return updates;
     }
   }
 
@@ -848,7 +995,7 @@ function hitVertex(world: Vec2, rippers: RipperState[], zoom: number): { ripper:
 function hitRipper(world: Vec2, rippers: RipperState[]): RipperState | undefined {
   for (let index = rippers.length - 1; index >= 0; index -= 1) {
     const ripper = rippers[index];
-    if (ripper && pointInsidePolygon(world, ripper.points)) return ripper;
+    if (ripper && pointInsidePolygon(world, ripperOutlinePoints(ripper))) return ripper;
   }
   return undefined;
 }
@@ -899,20 +1046,86 @@ function syncCanvasSize(canvas: HTMLCanvasElement) {
   ctx?.setTransform(dpr, 0, 0, dpr, 0, 0);
 }
 
-function closedPath(ctx: CanvasRenderingContext2D, points: Vec2[]) {
-  const first = points[0];
+function lerpPoint(a: Vec2, b: Vec2, t: number): Vec2 {
+  return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
+}
+
+// Trace the ripper outline as four cubic Béziers (one per edge). `corners` and
+// `controls` are already in screen space; `controls[i]` are the two controls of
+// the edge from corners[i] to corners[(i+1)%4].
+function ripperBezierPath(ctx: CanvasRenderingContext2D, corners: Vec2[], controls: [Vec2, Vec2][]) {
+  const first = corners[0];
   if (!first) return;
   ctx.beginPath();
   ctx.moveTo(first.x, first.y);
-  for (let index = 1; index < points.length; index += 1) {
-    const point = points[index]!;
-    ctx.lineTo(point.x, point.y);
+  for (let edge = 0; edge < 4; edge += 1) {
+    const [c1, c2] = controls[edge]!;
+    const end = corners[(edge + 1) % 4]!;
+    ctx.bezierCurveTo(c1.x, c1.y, c2.x, c2.y, end.x, end.y);
   }
   ctx.closePath();
 }
 
-function lerpPoint(a: Vec2, b: Vec2, t: number): Vec2 {
-  return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
+// Convert a quadratic Bézier (endpoints p0/p3, single control q) into the
+// equivalent cubic controls. Used while creating a curve so a single dragged
+// point gives a clean symmetric bend; the two controls then move independently.
+function quadraticToCubic(p0: Vec2, p3: Vec2, q: Vec2): [Vec2, Vec2] {
+  return [
+    { x: p0.x + (2 / 3) * (q.x - p0.x), y: p0.y + (2 / 3) * (q.y - p0.y) },
+    { x: p3.x + (2 / 3) * (q.x - p3.x), y: p3.y + (2 / 3) * (q.y - p3.y) }
+  ];
+}
+
+function distPointToSegment(point: Vec2, a: Vec2, b: Vec2): number {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const lengthSq = dx * dx + dy * dy;
+  if (lengthSq === 0) return Math.hypot(point.x - a.x, point.y - a.y);
+  let t = ((point.x - a.x) * dx + (point.y - a.y) * dy) / lengthSq;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(point.x - (a.x + t * dx), point.y - (a.y + t * dy));
+}
+
+// The curve control handle (one of an edge's two cubic controls) under `world`.
+// Only the selected ripper renders handles, so only it is hit-tested — invisible
+// handles on other rippers must not be draggable/removable or steal hover.
+function hitCurveHandle(
+  world: Vec2,
+  rippers: RipperState[],
+  zoom: number,
+  selectedId: string | undefined
+): { ripper: RipperState; edge: number; which: 0 | 1 } | undefined {
+  const radius = CURVE_HANDLE_HIT_PX / zoom;
+  for (let ripperIndex = rippers.length - 1; ripperIndex >= 0; ripperIndex -= 1) {
+    const ripper = rippers[ripperIndex];
+    if (!ripper?.edgeCurves || ripper.id !== selectedId) continue;
+    for (let edge = 0; edge < 4; edge += 1) {
+      if (!ripper.edgeCurves[edge]) continue;
+      const controls = edgeControls(ripper, edge);
+      for (const which of [0, 1] as const) {
+        const c = controls[which];
+        if (Math.hypot(c.x - world.x, c.y - world.y) <= radius) return { ripper, edge, which };
+      }
+    }
+  }
+  return undefined;
+}
+
+// A straight (uncurved) ripper edge near `world`, for the Cmd-to-add gesture.
+// Curved edges already expose handles, so they are skipped.
+function hitEdge(world: Vec2, rippers: RipperState[], zoom: number): { ripper: RipperState; edge: number } | undefined {
+  const radius = EDGE_HIT_PX / zoom;
+  for (let ripperIndex = rippers.length - 1; ripperIndex >= 0; ripperIndex -= 1) {
+    const ripper = rippers[ripperIndex];
+    if (!ripper) continue;
+    for (let edge = 0; edge < 4; edge += 1) {
+      if (ripper.edgeCurves?.[edge]) continue;
+      const a = ripper.points[edge]!;
+      const b = ripper.points[(edge + 1) % 4]!;
+      if (distPointToSegment(world, a, b) <= radius) return { ripper, edge };
+    }
+  }
+  return undefined;
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -925,10 +1138,17 @@ function updateHoverCursor(
   images: WorkspaceImageState[],
   rippers: RipperState[],
   zoom: number,
-  kind: WorkspaceKind
+  kind: WorkspaceKind,
+  cmd: boolean,
+  selectedId: string | undefined
 ) {
   if (hitVertex(world, rippers, zoom)) {
     setCanvasCursor(canvas, "pointer");
+  } else if (hitCurveHandle(world, rippers, zoom, selectedId)) {
+    setCanvasCursor(canvas, "pointer");
+  } else if (cmd && hitEdge(world, rippers, zoom)) {
+    // Cmd over a straight edge: signal that a click-drag will add a curve point.
+    setCanvasCursor(canvas, "copy");
   } else if (hitRipper(world, rippers)) {
     setCanvasCursor(canvas, "move");
   } else if (hitImage(world, images)) {
