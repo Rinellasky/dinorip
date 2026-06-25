@@ -1,5 +1,6 @@
 import { app, BrowserWindow, nativeImage, shell } from "electron";
 import path from "node:path";
+import sharp from "sharp";
 import { registerIpc } from "./ipc";
 
 // Set before the app is ready so the menu bar, About panel, and userData path
@@ -19,6 +20,47 @@ function appIconPath(): string {
     : path.join(app.getAppPath(), "build", "icon-rounded.png");
 }
 
+// Dev-only "police tape" badge: composite a yellow caution-tape band reading
+// "DEV" across the app icon so the build you're editing (pnpm dev) is obvious
+// at a glance in the Dock / taskbar next to any installed release. Generated at
+// runtime from the rounded icon so it always tracks the real brand mark.
+let devIcon: Electron.NativeImage | null = null;
+
+async function buildDevIcon(): Promise<Electron.NativeImage | null> {
+  const SIZE = 1024;
+  const cy = SIZE * 0.7;       // band sits across the lower third
+  const bandH = 210;
+  const edge = 12;            // black tape borders
+  const overlay = `<svg xmlns="http://www.w3.org/2000/svg" width="${SIZE}" height="${SIZE}">
+    <g transform="rotate(-18 ${SIZE / 2} ${cy})">
+      <rect x="-220" y="${cy - bandH / 2}" width="${SIZE + 440}" height="${bandH}" fill="#F2C200"/>
+      <rect x="-220" y="${cy - bandH / 2}" width="${SIZE + 440}" height="${edge}" fill="#141414"/>
+      <rect x="-220" y="${cy + bandH / 2 - edge}" width="${SIZE + 440}" height="${edge}" fill="#141414"/>
+      <text x="${SIZE / 2}" y="${cy}" text-anchor="middle" dominant-baseline="central"
+            font-family="Helvetica, Arial, sans-serif" font-size="150" font-weight="900"
+            letter-spacing="34" fill="#141414">DEV</text>
+    </g>
+  </svg>`;
+  try {
+    const iconBuf = await sharp(appIconPath()).png().toBuffer();
+    // Clip the tape to the icon's silhouette (dest-in against the icon's own
+    // alpha) so it never spills into the transparent gutter around the squircle.
+    const tape = await sharp(Buffer.from(overlay))
+      .composite([{ input: iconBuf, blend: "dest-in" }])
+      .png()
+      .toBuffer();
+    const buf = await sharp(iconBuf)
+      .composite([{ input: tape }])
+      .png()
+      .toBuffer();
+    const img = nativeImage.createFromBuffer(buf);
+    return img.isEmpty() ? null : img;
+  } catch (error) {
+    console.error("Failed to build dev icon badge:", error);
+    return null;
+  }
+}
+
 function createWindow(): void {
   const isMac = process.platform === "darwin";
   mainWindow = new BrowserWindow({
@@ -29,7 +71,7 @@ function createWindow(): void {
     backgroundColor: "#f4f4f2",
     show: false,
     title: "DinoRip",
-    icon: appIconPath(),
+    icon: devIcon ?? appIconPath(),
     // Drop the native chrome and let the renderer's header act as the title bar.
     // On macOS keep the traffic lights, nudged to sit inside the 22px header.
     titleBarStyle: isMac ? "hidden" : "default",
@@ -64,11 +106,15 @@ function createWindow(): void {
   }
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  // In dev, badge the icon with the "DEV" caution tape so it's obvious which
+  // build is running; packaged builds use the clean bundle icon.
+  if (!app.isPackaged) devIcon = await buildDevIcon();
+
   // In dev the macOS dock shows the generic Electron icon; packaged builds use
   // the bundle icon instead. Set it explicitly so dev matches the brand.
   if (process.platform === "darwin" && !app.isPackaged && app.dock) {
-    const icon = nativeImage.createFromPath(appIconPath());
+    const icon = devIcon ?? nativeImage.createFromPath(appIconPath());
     if (!icon.isEmpty()) app.dock.setIcon(icon);
   }
 
