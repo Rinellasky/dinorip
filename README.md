@@ -1,34 +1,21 @@
-<div align="center">
-
-# 🦖 DinoRip
-
-**A texture ripper & atlas workshop for game artists.**
+# DinoRip
 
 ![DinoRip screenshot](assets/screenshot.png)
 
-</div>
-
-DinoRip lets you rip textures out of reference photos and turn them into clean
-texture atlases. Place a perspective ripper over the geometry in an image,
-extract the surface into the atlas workspace, adjust it, and export a single
-texture file, all in a fast, pixel-styled desktop UI.
-
-It is a clean-room Electron + TypeScript rebuild of a classic texture ripper
-workflow.
+Desktop texture ripper for building PNG textures and texture atlases from
+reference images.
 
 ## Features
 
-- **Image ripper**: load PNG/JPG/JPEG reference images and place a four-point
-  perspective ripper over the object's surface; drag vertices or the whole ripper.
-- **Perspective extraction**: sample the ripped quad into a flat texture in the
-  atlas workspace.
-- **Texture atlas**: move, resize (corners or edges), rotate, and edge-snap
-  extracted textures, one-click **Pack** to arrange them tightly, then export
-  them as a single atlas file.
-- **Texture options**: brightness, contrast, saturation, hue shift, grayscale,
-  invert, and sharpen, applied across one or all textures.
-- **Export**: export the selected texture, export all textures, or export the
-  full atlas as PNG.
+- Load PNG, JPG, and JPEG source images, or paste image files from the clipboard.
+- Add perspective rippers, move corners, bend edges, and extract textures.
+- Auto-extract edited rippers into the atlas workspace.
+- Move, resize, rotate, pack, and size atlas textures.
+- Edit texture color with brightness, contrast, saturation, hue shift,
+  grayscale, invert, sharpen, posterize, dithering, and saved presets.
+- Apply texture adjustments to one texture or all atlas textures.
+- Export the selected texture, every texture, or the full atlas as PNG.
+- Use undo/redo, pan/zoom, fullscreen, and the in-app shortcuts overlay.
 
 <!-- SHORTCUTS:START -->
 <!-- Generated from apps/desktop/src/renderer/shortcuts.data.json by scripts/generate-readme-shortcuts.mjs. Do not edit by hand; run `pnpm gen:shortcuts`. -->
@@ -84,50 +71,26 @@ workflow.
 | Toggle conserve / rectify | Right-click the texture |  |
 <!-- SHORTCUTS:END -->
 
-## Project structure
-
-| Path | Description |
-| --- | --- |
-| `packages/core` | Pure TypeScript: image models, bilinear sampling, perspective extraction, flip/resize, atlas rasterization. |
-| `packages/ipc-contracts` | Typed IPC channels and shared constants. |
-| `apps/desktop` | Electron main/preload, React + Vite renderer, Canvas workspaces, worker processing, and electron-builder config. |
-
-## Getting started
+## Development
 
 ```sh
 pnpm install
 pnpm dev
 ```
 
-`pnpm dev` starts Vite and Electron together.
-
-### Other scripts
+Useful checks:
 
 ```sh
-pnpm typecheck   # type-check every package
-pnpm test        # run unit tests
-pnpm lint        # lint all packages
-pnpm build       # build all packages
+pnpm typecheck
+pnpm test
+pnpm lint
+pnpm build
 ```
-
-## Packaging
-
-The desktop app packages with [electron-builder](https://www.electron.build/)
-for macOS, Windows, and Linux:
-
-```sh
-pnpm --filter @dinorip/desktop dist
-```
-
-> [!NOTE]
-> `sharp` ships platform-specific native binaries, so each OS target must be
-> packaged on (or cross-installed for) that platform. Code signing and
-> notarization are not configured.
 
 ## Requirements
 
-- [Node.js](https://nodejs.org/) 18+
-- [pnpm](https://pnpm.io/) 11+
+- Node.js 18+
+- pnpm 11+
 
 ## License
 
