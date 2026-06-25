@@ -47,7 +47,7 @@ ripper / seamless-maker workflow.
 | Toggle fullscreen | ⌘/Ctrl + F |  |
 | Paste from clipboard | ⌘/Ctrl + V |  |
 | Zoom | Mouse wheel | ![Zoom demo](assets/shortcuts/zoom.gif) |
-| Pan the view | Middle-drag, or drag empty canvas |  |
+| Pan the view | Middle-drag, or drag empty canvas | ![Pan the view demo](assets/shortcuts/pan.gif) |
 | Delete selection | Delete / Backspace |  |
 
 ### Ripper
@@ -56,11 +56,11 @@ ripper / seamless-maker workflow.
 | --- | --- | --- |
 | Add a ripper | A |  |
 | Extract the ripper | Enter |  |
-| Select a ripper | Click it |  |
-| Move the ripper | Drag inside the ripper |  |
-| Move a corner | Drag a corner |  |
-| Scale the ripper | ⌘/Ctrl + drag a corner |  |
-| Bend an edge | ⌘/Ctrl + drag an edge |  |
+| Select a ripper | Click it | ![Select a ripper demo](assets/shortcuts/select-ripper.gif) |
+| Move the ripper | Drag inside the ripper | ![Move the ripper demo](assets/shortcuts/move-ripper.gif) |
+| Move a corner | Drag a corner | ![Move a corner demo](assets/shortcuts/move-corner.gif) |
+| Scale the ripper | ⌘/Ctrl + drag a corner | ![Scale the ripper demo](assets/shortcuts/scale-ripper.gif) |
+| Bend an edge | ⌘/Ctrl + drag an edge | ![Bend an edge demo](assets/shortcuts/bend-edge.gif) |
 | Reshape a curve | Drag a curve handle |  |
 | Remove a curve | Double-click a curve handle |  |
 | Add/remove a corner | ⇧ + click a corner |  |
