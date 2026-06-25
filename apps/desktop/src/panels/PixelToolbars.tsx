@@ -3,6 +3,7 @@ import type { ReactElement } from "react";
 import {
   Download,
   Images,
+  LayoutGrid,
   Package,
   Plus,
   Redo2,
@@ -36,6 +37,7 @@ interface AtlasToolbarProps {
   onSetWidth(value: number): void;
   onSetHeight(value: number): void;
   onToggleSquare(): void;
+  onPack(): void;
   onExportSelected(): void;
   onExportAll(): void;
   onExportAtlas(): void;
@@ -88,6 +90,10 @@ export function AtlasToolbar(props: AtlasToolbarProps): ReactElement {
         </button>
       </div>
       <div className="atlas-exports">
+        <button type="button" onClick={props.onPack} disabled={!props.hasImages} title="Pack textures tightly to minimise wasted space">
+          <LayoutGrid size={12} />
+          Pack
+        </button>
         <button type="button" onClick={props.onExportSelected} disabled={!props.hasSelection} title="Export the selected texture">
           <Download size={12} />
           Export

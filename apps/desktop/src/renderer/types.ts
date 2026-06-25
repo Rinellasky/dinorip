@@ -16,6 +16,8 @@ export interface WorkspaceImageState {
   originalImage: PixelImage;
   position: Vec2;
   scale: Vec2;
+  /** Rotation in radians, counter-clockwise in world space (atlas textures). */
+  rotation: number;
   settings: TextureSettings;
   version: number;
 }

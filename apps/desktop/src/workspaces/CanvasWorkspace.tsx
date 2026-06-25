@@ -58,6 +58,8 @@ interface CanvasWorkspaceProps {
   // snapping is resolved by the canvas before this is called.
   onMoveImage(id: string, position: Vec2): void;
   onScaleImage(id: string, nextScale: Vec2): void;
+  /** Atlas only: set a texture's rotation (radians, CCW in world space). */
+  onRotateImage?(id: string, rotation: number): void;
   onMoveRipper?(id: string, delta: Vec2): void;
   onMoveVertex?(id: string, index: number, point: Vec2): void;
   /** Batched corner move — used for group drags and Cmd-uniform-scaling. */
@@ -74,7 +76,8 @@ interface CanvasWorkspaceProps {
   onImageEditEnd?(): void;
 }
 
-type HandleKey = "tl" | "tr" | "bl" | "br";
+// A resize handle either drives a corner (both axes) or one edge (single axis).
+type ResizeMode = "corner" | "edge-x" | "edge-y";
 
 type VertexRef = { id: string; index: number };
 type VertexUpdate = { id: string; index: number; point: Vec2 };
@@ -96,7 +99,13 @@ type DragState =
   // a single frame. From a stable anchor the unsnapped target always tracks the
   // cursor, so snapping engages and releases cleanly.
   | { type: "image"; id: string; startWorld: Vec2; startPos: Vec2 }
-  | { type: "resize"; id: string; handle: HandleKey; anchor: Vec2 }
+  // Resizing the selected atlas texture from a corner or edge handle. `anchor`
+  // is the fixed point (opposite corner, or opposite edge midpoint) in world
+  // space; `startScale` is the scale at grab time so a Shift-held proportional
+  // resize can preserve the texture's aspect ratio.
+  | { type: "resize"; id: string; mode: ResizeMode; anchor: Vec2; startScale: Vec2 }
+  // Rotating the selected atlas texture around its centre via the stem handle.
+  | { type: "rotate"; id: string; center: Vec2 }
   | { type: "ripper"; id: string; lastWorld: Vec2 }
   // A corner drag. `startWorld`/`startPoints` snapshot the moment the drag began
   // so Cmd-scaling and group moves can be recomputed from a stable baseline
@@ -115,6 +124,12 @@ type DragState =
 
 const HANDLE_SCREEN_SIZE = 8;
 const HANDLE_HIT_RADIUS = 9;
+// Edge (midpoint) resize handles are a touch smaller and have their own pickup.
+const EDGE_HANDLE_HIT_RADIUS = 8;
+// The rotation handle floats this many screen px beyond the top edge midpoint.
+const ROT_HANDLE_OFFSET = 22;
+const ROT_HANDLE_RADIUS = 5;
+const ROT_HANDLE_HIT_RADIUS = 9;
 const VERTEX_HANDLE_SIZE = 7;
 const VERTEX_HANDLE_SELECTED_SIZE = 10;
 // Curve control handles are drawn as small circles, distinct from corner squares.
@@ -179,16 +194,22 @@ export function CanvasWorkspace(props: CanvasWorkspaceProps): ReactElement {
     if (event.button !== 0) return;
     const world = toWorld(event);
 
-    // Resize handles take priority over the image body so grabbing a corner of
-    // the selected atlas texture scales it instead of moving it.
+    // Rotate / resize handles take priority over the image body so grabbing a
+    // handle of the selected atlas texture transforms it instead of moving it.
     if (props.kind === "atlas" && selectedImage) {
       const rect = canvas.getBoundingClientRect();
       const screen = { x: event.clientX - rect.left, y: event.clientY - rect.top };
-      const handle = hitHandle(screen, selectedImage, canvas, props.view);
-      if (handle) {
-        dragRef.current = { type: "resize", id: selectedImage.id, handle: handle.key, anchor: handle.anchor };
+      const control = hitImageControl(screen, selectedImage, canvas, props.view);
+      if (control?.kind === "rotate") {
+        dragRef.current = { type: "rotate", id: selectedImage.id, center: selectedImage.position };
         props.onImageEditStart?.(selectedImage.id);
-        setCanvasCursor(canvas, handleCursor(handle.key));
+        setCanvasCursor(canvas, "grabbing");
+        return;
+      }
+      if (control && control.anchor && control.mode) {
+        dragRef.current = { type: "resize", id: selectedImage.id, mode: control.mode, anchor: control.anchor, startScale: { ...selectedImage.scale } };
+        props.onImageEditStart?.(selectedImage.id);
+        setCanvasCursor(canvas, control.cursor);
         return;
       }
     }
@@ -378,7 +399,19 @@ export function CanvasWorkspace(props: CanvasWorkspaceProps): ReactElement {
 
     if (drag.type === "resize") {
       const image = props.images.find((item) => item.id === drag.id);
-      if (image) resizeImageToPointer(image, drag.anchor, toWorld(event), props.onMoveImage, props.onScaleImage);
+      // Shift locks the aspect ratio (proportional resize); free otherwise.
+      if (image) resizeImageToPointer(image, drag, toWorld(event), event.shiftKey, props.onMoveImage, props.onScaleImage);
+      return;
+    }
+
+    if (drag.type === "rotate" && props.onRotateImage) {
+      const world = toWorld(event);
+      // The stem handle points along the texture's local +y at rotation 0
+      // (straight up), so subtract a quarter turn from the pointer angle.
+      let rotation = Math.atan2(world.y - drag.center.y, world.x - drag.center.x) - Math.PI / 2;
+      // Shift snaps to 45° increments.
+      if (event.shiftKey) rotation = Math.round(rotation / (Math.PI / 4)) * (Math.PI / 4);
+      props.onRotateImage(drag.id, rotation);
       return;
     }
 
@@ -400,9 +433,9 @@ export function CanvasWorkspace(props: CanvasWorkspaceProps): ReactElement {
     if (props.kind === "atlas" && selectedImage) {
       const rect = canvas.getBoundingClientRect();
       const screen = { x: event.clientX - rect.left, y: event.clientY - rect.top };
-      const handle = hitHandle(screen, selectedImage, canvas, props.view);
-      if (handle) {
-        setCanvasCursor(canvas, handleCursor(handle.key));
+      const control = hitImageControl(screen, selectedImage, canvas, props.view);
+      if (control) {
+        setCanvasCursor(canvas, control.cursor);
         return;
       }
     }
@@ -442,7 +475,7 @@ export function CanvasWorkspace(props: CanvasWorkspaceProps): ReactElement {
 
     const wasEditingRipper =
       drag.type === "vertex" || drag.type === "ripper" || drag.type === "createCurve" || drag.type === "curveHandle";
-    const wasEditingImage = drag.type === "image" || drag.type === "resize";
+    const wasEditingImage = drag.type === "image" || drag.type === "resize" || drag.type === "rotate";
     dragRef.current = { type: "none" };
     if (canvas) setCanvasCursor(canvas, "grab");
     if (wasEditingRipper) props.onRipperEditEnd?.();
@@ -522,14 +555,23 @@ function drawWorkspace(
     const bitmap = usingLive ? live.canvas : cachedCanvas(image, cache);
     const pixelWidth = usingLive ? live.width : image.image.width;
     const pixelHeight = usingLive ? live.height : image.image.height;
-    const rect = imageScreenRect(image, pixelWidth, pixelHeight, canvas, props.view);
+    // Draw the texture centred on its world position, rotating the canvas about
+    // that centre. Flips are applied as a sign scale so the drawn size stays
+    // positive; at rotation 0 with no flip this matches the old top-left blit.
+    const center = worldToScreen(image.position, canvas, props.view);
+    const width = pixelWidth * Math.abs(image.scale.x) * props.view.zoom;
+    const height = pixelHeight * Math.abs(image.scale.y) * props.view.zoom;
     ctx.save();
     ctx.imageSmoothingEnabled = props.view.zoom <= 1;
-    ctx.drawImage(bitmap, rect.x, rect.y, rect.width, rect.height);
+    ctx.translate(center.x, center.y);
+    // World rotation is CCW; screen y is flipped, so negate it for the canvas.
+    if (image.rotation) ctx.rotate(-image.rotation);
+    ctx.scale(Math.sign(image.scale.x) || 1, Math.sign(image.scale.y) || 1);
+    ctx.drawImage(bitmap, -width / 2, -height / 2, width, height);
     if (image.id === props.selectedImageId) {
       ctx.strokeStyle = "#2f7d6d";
       ctx.lineWidth = 2;
-      ctx.strokeRect(rect.x, rect.y, rect.width, rect.height);
+      ctx.strokeRect(-width / 2, -height / 2, width, height);
     }
     ctx.restore();
   }
@@ -649,15 +691,16 @@ function drawRipper(
   // Vertex dragging works via geometric hit-testing (hitVertex), independent of
   // whether the handles below are drawn.
   ctx.lineWidth = selected ? 2 : 1.5;
-  ctx.strokeStyle = "rgba(8, 9, 8, 0.85)";
+  ctx.strokeStyle = selected ? "rgba(8, 9, 8, 0.85)" : "rgba(8, 9, 8, 0.55)";
   ctx.setLineDash([]);
   ripperBezierPath(ctx, points, controls);
   ctx.stroke();
 
   ctx.lineWidth = selected ? 1.5 : 1;
-  ctx.strokeStyle = selected ? "#efe5c7" : "#9b968a";
+  ctx.strokeStyle = selected ? "#efe5c7" : "#c4baa3";
   ctx.setLineDash([6, 5]);
-  ctx.lineDashOffset = selected ? -(time / 40) : 0;
+  // Inactive rippers crawl at roughly half speed so they stay lively but calm.
+  ctx.lineDashOffset = -(time / (selected ? 40 : 85));
   ripperBezierPath(ctx, points, controls);
   ctx.stroke();
   ctx.setLineDash([]);
@@ -755,95 +798,173 @@ function cachedCanvas(image: WorkspaceImageState, cache: Map<string, { version: 
   return canvas;
 }
 
-function imageScreenRect(image: WorkspaceImageState, pixelWidth: number, pixelHeight: number, canvas: HTMLCanvasElement, view: ViewState) {
-  const widthWorld = pixelWidth * image.scale.x;
-  const heightWorld = pixelHeight * image.scale.y;
-  const topLeft = worldToScreen(
-    { x: image.position.x - widthWorld / 2, y: image.position.y + heightWorld / 2 },
-    canvas,
-    view
-  );
-  return {
-    x: topLeft.x,
-    y: topLeft.y,
-    width: widthWorld * view.zoom,
-    height: heightWorld * view.zoom
-  };
-}
-
-interface ImageHandle {
-  key: HandleKey;
+// A draggable handle around the selected atlas texture: four corners (resize
+// both axes), four edge midpoints (resize one axis), and one rotation stem.
+interface ImageControl {
+  tag: string;
+  kind: "corner" | "edge" | "rotate";
   /** Screen-space centre of the handle. */
   screen: Vec2;
-  /** World-space opposite corner, kept fixed while resizing. */
-  anchor: Vec2;
+  /** World-space fixed point kept pinned while resizing (corners/edges only). */
+  anchor?: Vec2;
+  /** Which axes a resize drives (corners/edges only). */
+  mode?: ResizeMode;
+  cursor: string;
 }
 
-// Four corner handles for the selected atlas image. `anchor` is the diagonally
-// opposite corner (world space), which stays pinned while the handle is dragged.
-function imageHandles(image: WorkspaceImageState, canvas: HTMLCanvasElement, view: ViewState): ImageHandle[] {
-  const halfW = (image.image.width * image.scale.x) / 2;
-  const halfH = (image.image.height * image.scale.y) / 2;
-  const left = image.position.x - halfW;
-  const right = image.position.x + halfW;
-  const top = image.position.y + halfH;
-  const bottom = image.position.y - halfH;
-  const corners: Record<HandleKey, { world: Vec2; anchor: Vec2 }> = {
-    tl: { world: { x: left, y: top }, anchor: { x: right, y: bottom } },
-    tr: { world: { x: right, y: top }, anchor: { x: left, y: bottom } },
-    bl: { world: { x: left, y: bottom }, anchor: { x: right, y: top } },
-    br: { world: { x: right, y: bottom }, anchor: { x: left, y: top } }
-  };
-  return (Object.keys(corners) as HandleKey[]).map((key) => ({
-    key,
-    screen: worldToScreen(corners[key].world, canvas, view),
-    anchor: corners[key].anchor
-  }));
+// All handles for the selected atlas texture, in screen space, honouring the
+// texture's rotation. Corner anchors are the diagonally opposite corner; edge
+// anchors are the opposite edge midpoint — both stay pinned while dragging.
+function imageControls(image: WorkspaceImageState, canvas: HTMLCanvasElement, view: ViewState): ImageControl[] {
+  const angle = image.rotation ?? 0;
+  const cos = Math.cos(angle);
+  const sin = Math.sin(angle);
+  // Centre-to-edge vectors along the texture's local axes (signed scale keeps
+  // flips), so corners/edges follow the rotated, possibly mirrored, rectangle.
+  const hw = (image.image.width * image.scale.x) / 2;
+  const hh = (image.image.height * image.scale.y) / 2;
+  const vx = { x: cos * hw, y: sin * hw };
+  const vy = { x: -sin * hh, y: cos * hh };
+  const pos = image.position;
+  const world = (a: number, b: number): Vec2 => ({ x: pos.x + a * vx.x + b * vy.x, y: pos.y + a * vx.y + b * vy.y });
+  const toScreen = (w: Vec2): Vec2 => worldToScreen(w, canvas, view);
+  const tl = world(-1, 1);
+  const tr = world(1, 1);
+  const br = world(1, -1);
+  const bl = world(-1, -1);
+  const top = world(0, 1);
+  const bottom = world(0, -1);
+  const right = world(1, 0);
+  const left = world(-1, 0);
+
+  // Rotation handle: a fixed screen distance beyond the top-edge midpoint, along
+  // the screen-space direction of the local +y axis.
+  const topScreen = toScreen(top);
+  const dir = { x: vy.x * view.zoom, y: -vy.y * view.zoom };
+  const len = Math.hypot(dir.x, dir.y) || 1;
+  const rotScreen = { x: topScreen.x + (dir.x / len) * ROT_HANDLE_OFFSET, y: topScreen.y + (dir.y / len) * ROT_HANDLE_OFFSET };
+
+  return [
+    { tag: "rot", kind: "rotate", screen: rotScreen, cursor: "grab" },
+    { tag: "tl", kind: "corner", screen: toScreen(tl), anchor: br, mode: "corner", cursor: "nwse-resize" },
+    { tag: "tr", kind: "corner", screen: toScreen(tr), anchor: bl, mode: "corner", cursor: "nesw-resize" },
+    { tag: "br", kind: "corner", screen: toScreen(br), anchor: tl, mode: "corner", cursor: "nwse-resize" },
+    { tag: "bl", kind: "corner", screen: toScreen(bl), anchor: tr, mode: "corner", cursor: "nesw-resize" },
+    { tag: "t", kind: "edge", screen: topScreen, anchor: bottom, mode: "edge-y", cursor: "ns-resize" },
+    { tag: "b", kind: "edge", screen: toScreen(bottom), anchor: top, mode: "edge-y", cursor: "ns-resize" },
+    { tag: "r", kind: "edge", screen: toScreen(right), anchor: left, mode: "edge-x", cursor: "ew-resize" },
+    { tag: "l", kind: "edge", screen: toScreen(left), anchor: right, mode: "edge-x", cursor: "ew-resize" }
+  ];
 }
 
-function hitHandle(screen: Vec2, image: WorkspaceImageState, canvas: HTMLCanvasElement, view: ViewState): ImageHandle | undefined {
-  for (const handle of imageHandles(image, canvas, view)) {
-    if (Math.hypot(handle.screen.x - screen.x, handle.screen.y - screen.y) <= HANDLE_HIT_RADIUS) return handle;
-  }
+// Pick a handle under the pointer (screen space). Rotation wins over corners,
+// corners over edges, so overlapping pickup zones resolve to the finer control.
+function hitImageControl(screen: Vec2, image: WorkspaceImageState, canvas: HTMLCanvasElement, view: ViewState): ImageControl | undefined {
+  const controls = imageControls(image, canvas, view);
+  const near = (control: ImageControl, radius: number) =>
+    Math.hypot(control.screen.x - screen.x, control.screen.y - screen.y) <= radius;
+  for (const control of controls) if (control.kind === "rotate" && near(control, ROT_HANDLE_HIT_RADIUS)) return control;
+  for (const control of controls) if (control.kind === "corner" && near(control, HANDLE_HIT_RADIUS)) return control;
+  for (const control of controls) if (control.kind === "edge" && near(control, EDGE_HANDLE_HIT_RADIUS)) return control;
   return undefined;
 }
 
-function handleCursor(key: HandleKey): string {
-  return key === "tl" || key === "br" ? "nwse-resize" : "nesw-resize";
-}
-
-// Scale the image so the dragged corner follows the pointer while the opposite
-// corner stays put. Width/height move independently (free resize); the centre is
-// shifted so the anchor corner stays fixed even when a dimension hits the floor.
+// Resize the texture so the dragged handle follows the pointer while `anchor`
+// stays pinned. Work in the texture's local frame so rotated textures resize
+// along their own axes; corners drive both axes, edges drive one. Shift locks
+// the aspect ratio captured at grab time (proportional resize).
 function resizeImageToPointer(
   image: WorkspaceImageState,
-  anchor: Vec2,
+  drag: Extract<DragState, { type: "resize" }>,
   pointer: Vec2,
+  proportional: boolean,
   onMoveImage: (id: string, position: Vec2) => void,
   onScaleImage: (id: string, scale: Vec2) => void
 ) {
-  const scaleX = Math.max(IMAGE_MIN_SCALE, Math.abs(pointer.x - anchor.x) / image.image.width);
-  const scaleY = Math.max(IMAGE_MIN_SCALE, Math.abs(pointer.y - anchor.y) / image.image.height);
-  const newWidth = scaleX * image.image.width;
-  const newHeight = scaleY * image.image.height;
-  const signX = pointer.x >= anchor.x ? 1 : -1;
-  const signY = pointer.y >= anchor.y ? 1 : -1;
-  const center = { x: anchor.x + (signX * newWidth) / 2, y: anchor.y + (signY * newHeight) / 2 };
-  onScaleImage(image.id, { x: scaleX, y: scaleY });
-  onMoveImage(image.id, center);
+  const angle = image.rotation ?? 0;
+  const ux = { x: Math.cos(angle), y: Math.sin(angle) };
+  const uy = { x: -Math.sin(angle), y: Math.cos(angle) };
+  const dx = pointer.x - drag.anchor.x;
+  const dy = pointer.y - drag.anchor.y;
+  const du = dx * ux.x + dy * ux.y; // extent along local +x
+  const dv = dx * uy.x + dy * uy.y; // extent along local +y
+  const imgW = image.image.width;
+  const imgH = image.image.height;
+
+  if (drag.mode === "edge-x") {
+    const mag = Math.max(IMAGE_MIN_SCALE, Math.abs(du) / imgW);
+    const sign = du >= 0 ? 1 : -1;
+    const half = (mag * imgW) / 2;
+    onScaleImage(image.id, { x: mag, y: drag.startScale.y });
+    onMoveImage(image.id, { x: drag.anchor.x + sign * half * ux.x, y: drag.anchor.y + sign * half * ux.y });
+    return;
+  }
+
+  if (drag.mode === "edge-y") {
+    const mag = Math.max(IMAGE_MIN_SCALE, Math.abs(dv) / imgH);
+    const sign = dv >= 0 ? 1 : -1;
+    const half = (mag * imgH) / 2;
+    onScaleImage(image.id, { x: drag.startScale.x, y: mag });
+    onMoveImage(image.id, { x: drag.anchor.x + sign * half * uy.x, y: drag.anchor.y + sign * half * uy.y });
+    return;
+  }
+
+  let magU = Math.max(IMAGE_MIN_SCALE, Math.abs(du) / imgW);
+  let magV = Math.max(IMAGE_MIN_SCALE, Math.abs(dv) / imgH);
+  if (proportional) {
+    // Scale both axes by the larger factor relative to the grab-time scale so
+    // the corner stays under the cursor and the aspect ratio is preserved.
+    const baseU = Math.abs(drag.startScale.x) || IMAGE_MIN_SCALE;
+    const baseV = Math.abs(drag.startScale.y) || IMAGE_MIN_SCALE;
+    const factor = Math.max(magU / baseU, magV / baseV);
+    magU = baseU * factor;
+    magV = baseV * factor;
+  }
+  const signU = du >= 0 ? 1 : -1;
+  const signV = dv >= 0 ? 1 : -1;
+  const halfU = (magU * imgW) / 2;
+  const halfV = (magV * imgH) / 2;
+  onScaleImage(image.id, { x: magU, y: magV });
+  onMoveImage(image.id, {
+    x: drag.anchor.x + signU * halfU * ux.x + signV * halfV * uy.x,
+    y: drag.anchor.y + signU * halfU * ux.y + signV * halfV * uy.y
+  });
 }
 
 function drawImageHandles(ctx: CanvasRenderingContext2D, canvas: HTMLCanvasElement, view: ViewState, image: WorkspaceImageState) {
-  const half = HANDLE_SCREEN_SIZE / 2;
+  const controls = imageControls(image, canvas, view);
+  const topMid = controls.find((control) => control.tag === "t");
+  const rot = controls.find((control) => control.kind === "rotate");
   ctx.save();
-  for (const handle of imageHandles(image, canvas, view)) {
-    const x = Math.round(handle.screen.x - half);
-    const y = Math.round(handle.screen.y - half);
+  // Stem connecting the top edge to the rotation handle.
+  if (topMid && rot) {
+    ctx.strokeStyle = "#2f7d6d";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(topMid.screen.x, topMid.screen.y);
+    ctx.lineTo(rot.screen.x, rot.screen.y);
+    ctx.stroke();
+  }
+  for (const control of controls) {
+    if (control.kind === "rotate") {
+      ctx.beginPath();
+      ctx.arc(control.screen.x, control.screen.y, ROT_HANDLE_RADIUS, 0, Math.PI * 2);
+      ctx.fillStyle = "#efe5c7";
+      ctx.fill();
+      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = "#2f7d6d";
+      ctx.stroke();
+      continue;
+    }
+    const size = control.kind === "edge" ? HANDLE_SCREEN_SIZE - 2 : HANDLE_SCREEN_SIZE;
+    const half = size / 2;
+    const x = Math.round(control.screen.x - half);
+    const y = Math.round(control.screen.y - half);
     ctx.fillStyle = "#efe5c7";
-    ctx.fillRect(x, y, HANDLE_SCREEN_SIZE, HANDLE_SCREEN_SIZE);
+    ctx.fillRect(x, y, size, size);
     ctx.lineWidth = 1.5;
     ctx.strokeStyle = "#2f7d6d";
-    ctx.strokeRect(x + 0.5, y + 0.5, HANDLE_SCREEN_SIZE - 1, HANDLE_SCREEN_SIZE - 1);
+    ctx.strokeRect(x + 0.5, y + 0.5, size - 1, size - 1);
   }
   ctx.restore();
 }
@@ -854,12 +975,14 @@ function hitImage(world: Vec2, images: WorkspaceImageState[]): WorkspaceImageSta
     if (!image) continue;
     const halfWidth = (image.image.width * Math.abs(image.scale.x)) / 2;
     const halfHeight = (image.image.height * Math.abs(image.scale.y)) / 2;
-    if (
-      world.x >= image.position.x - halfWidth &&
-      world.x <= image.position.x + halfWidth &&
-      world.y >= image.position.y - halfHeight &&
-      world.y <= image.position.y + halfHeight
-    ) {
+    // Inverse-rotate the cursor into the texture's local frame so the hit test
+    // tracks the rotated rectangle rather than its axis-aligned bounding box.
+    const angle = image.rotation ?? 0;
+    const dx = world.x - image.position.x;
+    const dy = world.y - image.position.y;
+    const localX = angle ? dx * Math.cos(angle) + dy * Math.sin(angle) : dx;
+    const localY = angle ? -dx * Math.sin(angle) + dy * Math.cos(angle) : dy;
+    if (Math.abs(localX) <= halfWidth && Math.abs(localY) <= halfHeight) {
       return image;
     }
   }
@@ -1013,8 +1136,11 @@ function snapImageToNeighbors(
 ): Vec2 {
   const dragged = images.find((item) => item.id === id);
   if (!dragged) return target;
+  // Edge-snapping assumes axis-aligned rectangles, so a rotated texture (or
+  // rotated neighbours) is skipped rather than snapped to a misleading box.
+  if (dragged.rotation) return target;
   const moved: AtlasItem = { image: dragged.image, position: target, scale: dragged.scale };
-  const neighbors = images.filter((item) => item.id !== id);
+  const neighbors = images.filter((item) => item.id !== id && !item.rotation);
   if (neighbors.length === 0) return target;
   return snapAtlasItem(moved, neighbors, SNAP_DISTANCE / Math.max(zoom, 1e-6));
 }

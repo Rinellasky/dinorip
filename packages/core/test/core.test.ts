@@ -18,6 +18,7 @@ import {
   makeSeamless,
   offsetWrap,
   opaque,
+  packAtlasPositions,
   pointInsidePolygon,
   rasterizeAtlas,
   sampleBilinear,
@@ -357,6 +358,63 @@ describe("atlas rasterization", () => {
 
     expect(getPixel(raster.image, 0, 0).r).toBe(40);
     expect(getPixel(raster.image, 1, 0).b).toBe(255);
+  });
+
+  it("bakes rotation into the rasterized atlas", () => {
+    // A 2x1 strip: left pixel red, right pixel blue.
+    const strip = makeImage(2, 1);
+    setPixel(strip, 0, 0, opaque(255, 0, 0));
+    setPixel(strip, 1, 0, opaque(0, 0, 255));
+
+    // Rotating 90° CCW stands the strip on end (1 wide, 2 tall). The original
+    // right pixel (blue) swings to the top; the left pixel (red) to the bottom.
+    const item = { image: strip, position: { x: 0, y: 0 }, scale: { x: 1, y: 1 }, rotation: Math.PI / 2 };
+    const bounds = computeAtlasBounds([item]);
+    expect(Math.round(bounds.width)).toBe(1);
+    expect(Math.round(bounds.height)).toBe(2);
+
+    const raster = rasterizeAtlas([item]);
+    expect(raster.image.width).toBe(1);
+    expect(raster.image.height).toBe(2);
+    // Bilinear softens exact values, so assert which colour dominates each end.
+    const topPixel = getPixel(raster.image, 0, 0);
+    const bottomPixel = getPixel(raster.image, 0, 1);
+    expect(topPixel.b).toBeGreaterThan(topPixel.r);
+    expect(bottomPixel.r).toBeGreaterThan(bottomPixel.b);
+  });
+
+  it("packs atlas items into a non-overlapping, centred block", () => {
+    const big = makeImage(10, 10, opaque(255, 0, 0));
+    const small = makeImage(4, 4, opaque(0, 0, 255));
+    const items = [
+      { image: big, position: { x: 200, y: -50 }, scale: { x: 1, y: 1 } },
+      { image: small, position: { x: -300, y: 80 }, scale: { x: 1, y: 1 } },
+      { image: small, position: { x: 0, y: 0 }, scale: { x: 1, y: 1 } }
+    ];
+
+    const positions = packAtlasPositions(items);
+    expect(positions).toHaveLength(3);
+
+    // No two footprints overlap once moved to their packed positions.
+    const packed = items.map((item, index) => ({ ...item, position: positions[index]! }));
+    const rectOf = (item: (typeof packed)[number]) => {
+      const hw = (item.image.width * Math.abs(item.scale.x)) / 2;
+      const hh = (item.image.height * Math.abs(item.scale.y)) / 2;
+      return { left: item.position.x - hw, right: item.position.x + hw, bottom: item.position.y - hh, top: item.position.y + hh };
+    };
+    for (let a = 0; a < packed.length; a += 1) {
+      for (let b = a + 1; b < packed.length; b += 1) {
+        const ra = rectOf(packed[a]!);
+        const rb = rectOf(packed[b]!);
+        const overlap = ra.left < rb.right && ra.right > rb.left && ra.bottom < rb.top && ra.top > rb.bottom;
+        expect(overlap).toBe(false);
+      }
+    }
+
+    // The packed block stays compact rather than scattered across the canvas.
+    const bounds = computeAtlasBounds(packed);
+    expect(bounds.width).toBeLessThanOrEqual(20);
+    expect(bounds.height).toBeLessThanOrEqual(20);
   });
 
   it("snaps atlas item edges to nearest neighbors", () => {

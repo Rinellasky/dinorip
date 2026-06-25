@@ -22,8 +22,9 @@ ripper / seamless-maker workflow.
   perspective ripper over the object's surface; drag vertices or the whole ripper.
 - **Perspective extraction**: sample the ripped quad into a flat texture in the
   atlas workspace.
-- **Texture atlas**: move, scale (mouse wheel), and edge-snap extracted textures,
-  then export them as a single atlas file.
+- **Texture atlas**: move, resize (corners or edges), rotate, and edge-snap
+  extracted textures, one-click **Pack** to arrange them tightly, then export
+  them as a single atlas file.
 - **Texture options**: brightness, contrast, saturation, hue shift, grayscale,
   invert, and sharpen, applied across one or all textures.
 - **Seamless tiling**: Smoothed Collage and Scattered Edges seam generation with

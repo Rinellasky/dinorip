@@ -4,6 +4,7 @@ import { VIEWPORT_MAX_ZOOM, VIEWPORT_MIN_ZOOM } from "@dinorip/ipc-contracts";
 import {
   computeAtlasBounds,
   createRipper,
+  packAtlasPositions,
   flipVertical,
   getPixel,
   isRipperCurved,
@@ -805,6 +806,22 @@ export function App(): ReactElement {
     setAtlasImages((current) => current.map((image) => image.id === id ? { ...image, scale } : image));
   }
 
+  function rotateAtlasImage(id: string, rotation: number) {
+    setAtlasImages((current) => current.map((image) => image.id === id ? { ...image, rotation } : image));
+  }
+
+  // Auto-arrange every atlas texture into a tight, roughly-square block so the
+  // exported atlas wastes as little space as possible.
+  function packAtlasImages() {
+    if (atlasImages.length < 2) return;
+    commitHistory();
+    setAtlasImages((current) => {
+      const positions = packAtlasPositions(current.map(toAtlasItem));
+      return current.map((image, index) => ({ ...image, position: positions[index] ?? image.position }));
+    });
+    setStatus(`Packed ${atlasImages.length} textures`);
+  }
+
   function moveRipper(id: string, delta: Vec2) {
     setRippers((current) => current.map((ripper) => ripper.id === id
       ? {
@@ -1043,6 +1060,7 @@ export function App(): ReactElement {
               onSelectImage={setSelectedAtlasImageId}
               onMoveImage={moveAtlasImage}
               onScaleImage={scaleAtlasImage}
+              onRotateImage={rotateAtlasImage}
               onImageContextMenu={onAtlasImageContextMenu}
               onImageEditStart={onImageEditStart}
               onImageEditEnd={onImageEditEnd}
@@ -1056,6 +1074,7 @@ export function App(): ReactElement {
               onSetWidth={(value) => setAtlasManualSize((prev) => ({ width: value, height: prev?.height ?? atlasSizeHeight }))}
               onSetHeight={(value) => setAtlasManualSize((prev) => ({ width: prev?.width ?? atlasSizeWidth, height: value }))}
               onToggleSquare={() => setAtlasSquare((value) => !value)}
+              onPack={packAtlasImages}
               onExportSelected={() => void exportSelected()}
               onExportAll={() => void exportAll()}
               onExportAtlas={() => void exportAtlas()}
@@ -1140,13 +1159,14 @@ function makeWorkspaceImage(name: string, image: PixelImage, position: Vec2, isA
     originalImage: cloneForState(image),
     position,
     scale: { x: 1, y: 1 },
+    rotation: 0,
     settings: { ...defaultTextureSettings },
     version: 0
   };
 }
 
 function toAtlasItem(image: WorkspaceImageState): AtlasItem {
-  return { image: image.image, position: image.position, scale: image.scale };
+  return { image: image.image, position: image.position, scale: image.scale, rotation: image.rotation };
 }
 
 // Place a rasterized atlas at the top-left of a larger transparent canvas so the
@@ -1282,6 +1302,7 @@ function sourceImageSignature(image: WorkspaceImageState): string {
     formatNumber(image.position.y),
     formatNumber(image.scale.x),
     formatNumber(image.scale.y),
+    formatNumber(image.rotation),
     image.image.width,
     image.image.height,
     image.version
