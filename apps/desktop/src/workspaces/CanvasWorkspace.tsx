@@ -675,12 +675,12 @@ function drawRipper(
 
   ctx.save();
 
-  // Only the active ripper gets the rule-of-thirds guides and the marching-ants
-  // animation. Inactive rippers are drawn dimmed and static so attention stays
-  // on the selected one (and idle ones do not visually compete for it).
+  // Only the active ripper gets the rule-of-thirds guides. Inactive rippers keep
+  // their marching ants crawling — just slower and in a muted (not black) tone —
+  // so they still read as alive without competing with the selected one.
   if (selected) drawRuleOfThirds(ctx, points);
 
-  ctx.globalAlpha = selected ? 1 : 0.45;
+  ctx.globalAlpha = selected ? 1 : 0.6;
 
   // Screen-space cubic controls for each edge (defaults give straight segments).
   const controls = [0, 1, 2, 3].map((edge) =>
