@@ -13,6 +13,10 @@ if (!window.dinorip) {
   };
 }
 
+if (import.meta.env.DEV) {
+  void import("./renderer/benchmark").then(({ installBenchmark }) => installBenchmark());
+}
+
 createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <App />

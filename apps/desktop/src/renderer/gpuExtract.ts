@@ -128,6 +128,8 @@ const QUAD = new Float32Array([
   -1, -1, 0, 0 // bottom-left
 ]);
 
+const READBACK_CHUNK_BYTES = 2 * 1024 * 1024;
+
 interface GpuContext {
   gl: WebGL2RenderingContext;
   program: WebGLProgram;
@@ -462,10 +464,31 @@ export function gpuExtractPerspectiveAsync(
         }
         if (status === gl.WAIT_FAILED) return finish(null);
         const out = new Uint8ClampedArray(byteLength);
-        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, pbo);
-        gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, new Uint8Array(out.buffer), 0, byteLength);
-        gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
-        finish({ image: { width, height, data: out }, ownerIndex });
+        let offset = 0;
+        const copyChunk = () => {
+          try {
+            const length = Math.min(READBACK_CHUNK_BYTES, byteLength - offset);
+            gl.bindBuffer(gl.PIXEL_PACK_BUFFER, pbo);
+            gl.getBufferSubData(
+              gl.PIXEL_PACK_BUFFER,
+              offset,
+              new Uint8Array(out.buffer, offset, length),
+              0,
+              length
+            );
+            gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+            offset += length;
+            if (offset < byteLength) {
+              requestAnimationFrame(copyChunk);
+              return;
+            }
+            finish({ image: { width, height, data: out }, ownerIndex });
+          } catch {
+            gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+            finish(null);
+          }
+        };
+        copyChunk();
       };
       requestAnimationFrame(poll);
     });

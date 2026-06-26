@@ -11,7 +11,14 @@ import {
 import { edgeControls, pointInsidePolygon, ripperOutlinePoints, snapAtlasItem } from "@dinorip/core";
 import type { AtlasItem, Vec2 } from "@dinorip/core";
 import type { RipperState, ViewState, WorkspaceImageState, WorkspaceKind } from "../renderer/types";
-import { pixelImageToCanvas } from "../renderer/imageCanvas";
+import {
+  disposePixelImageSource,
+  pixelImageToImageSource,
+  type PixelImageSource
+} from "../renderer/imageCanvas";
+import { recordWorkspaceRender } from "../renderer/perf";
+
+export const WORKSPACE_RENDER_EVENT = "dinorip:render-workspaces";
 
 export interface WorkspaceLivePreview {
   /** The atlas image id this preview stands in for. */
@@ -51,6 +58,7 @@ interface CanvasWorkspaceProps {
   // image while a ripper is being dragged. Read every animation frame, so
   // updating its `.current` needs no React re-render.
   livePreview?: { readonly current: WorkspaceLivePreview | null };
+  onLivePreviewCached?(imageId: string): void;
   onViewChange(view: ViewState): void;
   onSelectImage(id?: string): void;
   onSelectRipper?(id?: string): void;
@@ -137,11 +145,19 @@ const CURVE_HANDLE_RADIUS = 5;
 // Screen-space pickup distance (world = / zoom) for curve handles and edges.
 const CURVE_HANDLE_HIT_PX = 9;
 const EDGE_HIT_PX = 7;
+const WORKSPACE_IMAGE_MAX_DISPLAY_SIZE = 768;
+
+type CachedDisplaySource = {
+  version: number;
+  source: PixelImageSource | null;
+  loading: boolean;
+};
 
 export function CanvasWorkspace(props: CanvasWorkspaceProps): ReactElement {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const dragRef = useRef<DragState>({ type: "none" });
-  const canvasCache = useRef(new Map<string, { version: number; canvas: HTMLCanvasElement }>());
+  const canvasCache = useRef(new Map<string, CachedDisplaySource>());
+  const renderNowRef = useRef<(time?: number) => void>(() => {});
   const rippers = props.rippers ?? [];
   // Multi-corner selection (keys are `${ripperId}#${index}`). Highlighted on the
   // canvas; dragging any member moves the whole set. Live marquee box is held in
@@ -154,23 +170,67 @@ export function CanvasWorkspace(props: CanvasWorkspaceProps): ReactElement {
     [props.images, props.selectedImageId]
   );
 
+  const renderNow = (time = performance.now()) => {
+    const canvas = canvasRef.current;
+    const ctx = canvas?.getContext("2d");
+    if (!canvas || !ctx) return;
+    syncCanvasSize(canvas);
+    recordWorkspaceRender(props.kind);
+    drawWorkspace(
+      ctx,
+      canvas,
+      props,
+      canvasCache.current,
+      time,
+      selectedVertices,
+      marqueeRef.current,
+      () => renderNowRef.current()
+    );
+  };
+  renderNowRef.current = renderNow;
+
   useEffect(() => {
-    let animation = 0;
-    const renderNow = (time: number) => {
-      const canvas = canvasRef.current;
-      const ctx = canvas?.getContext("2d");
-      if (!canvas || !ctx) return;
-      syncCanvasSize(canvas);
-      drawWorkspace(ctx, canvas, props, canvasCache.current, time, selectedVertices, marqueeRef.current);
-    };
-    const draw = (time: number) => {
-      renderNow(time);
-      animation = requestAnimationFrame(draw);
-    };
-    renderNow(performance.now());
-    animation = requestAnimationFrame(draw);
-    return () => cancelAnimationFrame(animation);
+    renderNow();
   }, [props, rippers, selectedImage, selectedVertices]);
+
+  useEffect(() => {
+    if (props.kind !== "source" || rippers.length === 0) return;
+    let frame = 0;
+    const tick = (time: number) => {
+      renderNowRef.current(time);
+      frame = window.requestAnimationFrame(tick);
+    };
+    frame = window.requestAnimationFrame(tick);
+    return () => window.cancelAnimationFrame(frame);
+  }, [props.kind, rippers.length]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const observer = new ResizeObserver(() => renderNow());
+    observer.observe(canvas);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    const onRenderRequest = () => renderNowRef.current();
+    window.addEventListener(WORKSPACE_RENDER_EVENT, onRenderRequest);
+    return () => window.removeEventListener(WORKSPACE_RENDER_EVENT, onRenderRequest);
+  }, []);
+
+  useEffect(() => {
+    const liveIds = new Set(props.images.map((image) => image.id));
+    for (const [id, cached] of canvasCache.current) {
+      if (liveIds.has(id)) continue;
+      disposePixelImageSource(cached.source);
+      canvasCache.current.delete(id);
+    }
+  }, [props.images]);
+
+  useEffect(() => () => {
+    for (const cached of canvasCache.current.values()) disposePixelImageSource(cached.source);
+    canvasCache.current.clear();
+  }, []);
 
   const toWorld = (event: React.MouseEvent<HTMLCanvasElement> | React.WheelEvent<HTMLCanvasElement>): Vec2 => {
     const canvas = canvasRef.current!;
@@ -386,6 +446,7 @@ export function CanvasWorkspace(props: CanvasWorkspaceProps): ReactElement {
         const rect = canvas.getBoundingClientRect();
         marqueeRef.current.x1 = event.clientX - rect.left;
         marqueeRef.current.y1 = event.clientY - rect.top;
+        renderNow();
       }
       return;
     }
@@ -532,10 +593,11 @@ function drawWorkspace(
   ctx: CanvasRenderingContext2D,
   canvas: HTMLCanvasElement,
   props: CanvasWorkspaceProps,
-  cache: Map<string, { version: number; canvas: HTMLCanvasElement }>,
+  cache: Map<string, CachedDisplaySource>,
   time: number,
   selectedVertices: Set<string>,
-  marquee: { x0: number; y0: number; x1: number; y1: number } | null
+  marquee: { x0: number; y0: number; x1: number; y1: number } | null,
+  onCacheReady: () => void
 ) {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   const width = canvas.clientWidth;
@@ -552,7 +614,11 @@ function drawWorkspace(
   const live = props.livePreview?.current ?? null;
   for (const image of props.images) {
     const usingLive = live !== null && live.imageId === image.id;
-    const bitmap = usingLive ? live.canvas : cachedCanvas(image, cache);
+    const cached = cachedImageSource(image, cache, () => {
+      if (props.livePreview?.current?.imageId === image.id) props.onLivePreviewCached?.(image.id);
+      onCacheReady();
+    });
+    const bitmap = usingLive ? live.canvas : cached?.source ?? null;
     const pixelWidth = usingLive ? live.width : image.image.width;
     const pixelHeight = usingLive ? live.height : image.image.height;
     // Draw the texture centred on its world position, rotating the canvas about
@@ -567,7 +633,11 @@ function drawWorkspace(
     // World rotation is CCW; screen y is flipped, so negate it for the canvas.
     if (image.rotation) ctx.rotate(-image.rotation);
     ctx.scale(Math.sign(image.scale.x) || 1, Math.sign(image.scale.y) || 1);
-    ctx.drawImage(bitmap, -width / 2, -height / 2, width, height);
+    if (bitmap) {
+      ctx.drawImage(bitmap, -width / 2, -height / 2, width, height);
+    } else {
+      drawImageLoadingPlaceholder(ctx, -width / 2, -height / 2, width, height);
+    }
     if (image.id === props.selectedImageId) {
       ctx.strokeStyle = "#2f7d6d";
       ctx.lineWidth = 2;
@@ -790,12 +860,42 @@ function drawRuleOfThirds(ctx: CanvasRenderingContext2D, points: Vec2[]) {
   ctx.restore();
 }
 
-function cachedCanvas(image: WorkspaceImageState, cache: Map<string, { version: number; canvas: HTMLCanvasElement }>): HTMLCanvasElement {
+function cachedImageSource(
+  image: WorkspaceImageState,
+  cache: Map<string, CachedDisplaySource>,
+  onReady: () => void
+): CachedDisplaySource {
   const cached = cache.get(image.id);
-  if (cached?.version === image.version) return cached.canvas;
-  const canvas = pixelImageToCanvas(image.image);
-  cache.set(image.id, { version: image.version, canvas });
-  return canvas;
+  if (cached?.version === image.version) return cached;
+  if (cached) disposePixelImageSource(cached.source);
+
+  const next: CachedDisplaySource = { version: image.version, source: null, loading: true };
+  cache.set(image.id, next);
+  void pixelImageToImageSource(image.image, { maxSize: WORKSPACE_IMAGE_MAX_DISPLAY_SIZE })
+    .then((source) => {
+      if (cache.get(image.id) !== next) {
+        disposePixelImageSource(source);
+        return;
+      }
+      next.source = source;
+      next.loading = false;
+      onReady();
+    })
+    .catch(() => {
+      if (cache.get(image.id) === next) next.loading = false;
+    });
+  return next;
+}
+
+function drawImageLoadingPlaceholder(ctx: CanvasRenderingContext2D, x: number, y: number, width: number, height: number) {
+  ctx.save();
+  ctx.fillStyle = "rgba(21, 23, 22, 0.36)";
+  ctx.fillRect(x, y, width, height);
+  ctx.strokeStyle = "rgba(239, 229, 199, 0.45)";
+  ctx.lineWidth = 1;
+  ctx.setLineDash([6, 5]);
+  ctx.strokeRect(x, y, width, height);
+  ctx.restore();
 }
 
 // A draggable handle around the selected atlas texture: four corners (resize

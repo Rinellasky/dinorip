@@ -7,6 +7,7 @@ import {
   packAtlasPositions,
   flipVertical,
   getPixel,
+  inferExtractionSize,
   isRipperCurved,
   makeImage,
   setPixel,
@@ -20,7 +21,7 @@ import type {
   PlacedImage,
   Vec2
 } from "@dinorip/core";
-import { CanvasWorkspace } from "./workspaces/CanvasWorkspace";
+import { CanvasWorkspace, WORKSPACE_RENDER_EVENT } from "./workspaces/CanvasWorkspace";
 import type { WorkspaceLivePreview } from "./workspaces/CanvasWorkspace";
 import { SidePanel } from "./panels/SidePanel";
 import { TiledPanel } from "./panels/TiledPanel";
@@ -31,7 +32,12 @@ import { ShortcutsOverlay } from "./panels/ShortcutsOverlay";
 import { defaultTextureSettings, defaultViewState } from "./renderer/types";
 import type { RipperState, TextureSettings, ViewState, WorkspaceImageState, WorkspaceKind } from "./renderer/types";
 import { cloneForState, fromIpcImage, pixelImageFromBlob, toIpcImage } from "./renderer/imageCanvas";
-import { gpuExtractPerspective, gpuExtractPerspectiveAsync, gpuRenderLivePreview, isGpuExtractAvailable } from "./renderer/gpuExtract";
+import { gpuExtractPerspective, gpuRenderLivePreview, isGpuExtractAvailable } from "./renderer/gpuExtract";
+import {
+  recordAsyncCommit,
+  recordStaleExtractionSkipped,
+  recordSyncExtraction
+} from "./renderer/perf";
 
 type WorkerResponse<T> = { id: string; ok: true; result: T } | { id: string; ok: false; error: string };
 
@@ -48,6 +54,10 @@ const PANEL_DESCRIPTIONS: Record<PanelId, string> = {
 const RIPPER_WORLD_SIZE = 100;
 const AUTO_EXTRACT_DELAY_MS = 180;
 const HISTORY_LIMIT = 50;
+const GPU_COMMIT_PIXEL_LIMIT = 300_000;
+const MAX_COMMIT_PIXEL_LIMIT = 300_000;
+const LIVE_PREVIEW_MAX_RENDER_SIZE = 1024;
+const LIVE_PREVIEW_PIXEL_LIMIT = 300_000;
 
 // A point-in-time copy of every user-editable piece of workspace state. Undo and
 // redo restore one of these wholesale. The arrays can be held by reference
@@ -97,7 +107,7 @@ export function App(): ReactElement {
   const autoExtractRun = useRef(0);
   const pendingJobs = useRef(new Map<string, { resolve: (value: any) => void; reject: (reason: Error) => void }>());
   // Live GPU projection shown in place of the atlas image while a ripper is
-  // dragged. Mutated outside React (read by the atlas canvas every frame).
+  // dragged. Mutated through setLivePreview(), which explicitly redraws canvases.
   const livePreviewRef = useRef<WorkspaceLivePreview | null>(null);
   const editingRipperIdRef = useRef<string | null>(null);
   // Geometry signature of the ripper at the moment an edit began. Lets edit-end
@@ -113,6 +123,19 @@ export function App(): ReactElement {
   const [undoStack, setUndoStack] = useState<HistorySnapshot[]>([]);
   const [redoStack, setRedoStack] = useState<HistorySnapshot[]>([]);
   const interactionSnapshot = useRef<HistorySnapshot | null>(null);
+
+  function requestCanvasRender() {
+    window.dispatchEvent(new Event(WORKSPACE_RENDER_EVENT));
+  }
+
+  function setLivePreview(preview: WorkspaceLivePreview | null) {
+    livePreviewRef.current = preview;
+    requestCanvasRender();
+  }
+
+  function clearLivePreviewIfCached(imageId: string) {
+    if (livePreviewRef.current?.imageId === imageId) setLivePreview(null);
+  }
 
   function snapshot(): HistorySnapshot {
     return {
@@ -146,7 +169,7 @@ export function App(): ReactElement {
   }
 
   function applySnapshot(state: HistorySnapshot) {
-    livePreviewRef.current = null;
+    setLivePreview(null);
     editingRipperIdRef.current = null;
     interactionSnapshot.current = null;
     setSourceImages(state.sourceImages);
@@ -192,6 +215,41 @@ export function App(): ReactElement {
       workerRef.current = null;
     };
   }, []);
+
+  useEffect(() => {
+    if (!import.meta.env.DEV) return;
+    const api = {
+      loadBenchmarkSource: (name: string, image: PixelImage) => {
+        appendSourceImages([{ name, image }]);
+        const fitZoom = Math.min(1, 520 / Math.max(image.width, image.height));
+        setSourceView({ zoom: clamp(fitZoom, VIEWPORT_MIN_ZOOM, VIEWPORT_MAX_ZOOM), pan: { x: 0, y: 0 } });
+        setStatus(`Benchmark loaded ${image.width} x ${image.height}`);
+      },
+      resetBenchmarkWorkspace: () => {
+        autoExtractRun.current += 1;
+        setLivePreview(null);
+        editingRipperIdRef.current = null;
+        editStartSignatureRef.current = null;
+        interactionSnapshot.current = null;
+        setSourceImages([]);
+        setAtlasImages([]);
+        setRippers([]);
+        setSelectedSourceImageId(undefined);
+        setSelectedAtlasImageId(undefined);
+        setSelectedRipperId(undefined);
+        setUndoStack([]);
+        setRedoStack([]);
+        setImageMenu(null);
+        setSourceView(defaultViewState);
+        setAtlasView(defaultViewState);
+        setStatus("Benchmark reset");
+      }
+    };
+    window.__dinoripDev = api;
+    return () => {
+      if (window.__dinoripDev === api) window.__dinoripDev = undefined;
+    };
+  });
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -349,17 +407,33 @@ export function App(): ReactElement {
     // perceptible debounce. The CPU/worker path stays debounced as a fallback.
     if (isGpuExtractAvailable()) {
       const frame = window.requestAnimationFrame(() => {
+        if (autoExtractRun.current !== runId) {
+          recordStaleExtractionSkipped();
+          return;
+        }
         const editingId = editingRipperIdRef.current;
         const editingRipper = editingId ? rippers.find((item) => item.id === editingId) : undefined;
         // While dragging an already-extracted ripper, project straight to the
         // GPU canvas with no readback — instant and independent of ripper size.
         if (editingRipper?.outputImageId) {
-          const preview = gpuRenderLivePreview(editingRipper, toPlacedImages(sourceImages));
+          const previewSize = inferExtractionSize(editingRipper);
+          const canRenderLivePreview = previewSize.width * previewSize.height <= LIVE_PREVIEW_PIXEL_LIMIT;
+          const preview = canRenderLivePreview
+            ? gpuRenderLivePreview(
+              editingRipper,
+              toPlacedImages(sourceImages),
+              LIVE_PREVIEW_MAX_RENDER_SIZE
+            )
+            : null;
           if (preview) {
-            livePreviewRef.current = { imageId: editingRipper.outputImageId, ...preview };
+            setLivePreview({ imageId: editingRipper.outputImageId, ...preview });
             return;
           }
         }
+        // If a brand-new ripper is being dragged before it has an atlas output,
+        // defer the full bake to pointer-up. Doing readbacks on every move is
+        // exactly the freeze case for very large, skewed rippers.
+        if (editingRipper) return;
         // Otherwise bake into state (creates the atlas image, refines to full
         // resolution, and feeds the export/seamless pipeline).
         autoExtractGpu(runId, rippers, sourceImages, selectedRipperId);
@@ -535,7 +609,7 @@ export function App(): ReactElement {
   function deleteRipper() {
     if (!selectedRipperId) return;
     commitHistory();
-    livePreviewRef.current = null;
+    setLivePreview(null);
     setImageMenu(null);
     const ripper = rippers.find((item) => item.id === selectedRipperId);
     setRippers((current) => current.filter((item) => item.id !== selectedRipperId));
@@ -555,7 +629,13 @@ export function App(): ReactElement {
       return;
     }
 
-    livePreviewRef.current = null;
+    const outputSize = extractionOutputSize(ripper);
+    if (outputSize.pixels > MAX_COMMIT_PIXEL_LIMIT) {
+      setStatus(tooLargeStatus(outputSize));
+      return;
+    }
+
+    setLivePreview(null);
     setStatus("Extracting texture...");
     const images: PlacedImage[] = sourceImages.map((image) => ({
       image: image.image,
@@ -592,7 +672,21 @@ export function App(): ReactElement {
     ripper: RipperState;
     index: number;
     outputImageId: string;
+    outputSize: ExtractionOutputSize;
     result: ExtractionResult;
+  };
+
+  type ExtractionJob = {
+    ripper: RipperState;
+    index: number;
+    outputImageId: string;
+    outputSize: ExtractionOutputSize;
+  };
+
+  type ExtractionOutputSize = {
+    width: number;
+    height: number;
+    pixels: number;
   };
 
   function toPlacedImages(sourceSnapshot: WorkspaceImageState[]): PlacedImage[] {
@@ -605,15 +699,43 @@ export function App(): ReactElement {
 
   function buildExtractionInputs(ripperSnapshot: RipperState[], sourceSnapshot: WorkspaceImageState[]) {
     const sourceItems = toPlacedImages(sourceSnapshot);
-    const jobs = ripperSnapshot.map((ripper, index) => ({
+    const allJobs = ripperSnapshot.map((ripper, index): ExtractionJob => ({
       ripper,
       index,
-      outputImageId: ripper.outputImageId ?? createId("atlas")
+      outputImageId: ripper.outputImageId ?? createId("atlas"),
+      outputSize: extractionOutputSize(ripper)
     }));
-    return { sourceItems, jobs };
+    const jobs = allJobs.filter((job) => job.outputSize.pixels <= MAX_COMMIT_PIXEL_LIMIT);
+    const skipped = allJobs.filter((job) => job.outputSize.pixels > MAX_COMMIT_PIXEL_LIMIT);
+    return { sourceItems, jobs, skipped };
   }
 
-  function applyExtraction(extracted: ResolvedExtraction[], selectedRipperSnapshot?: string) {
+  function extractionOutputSize(ripper: RipperState): ExtractionOutputSize {
+    const size = inferExtractionSize(ripper);
+    return {
+      width: size.width,
+      height: size.height,
+      pixels: size.width * size.height
+    };
+  }
+
+  function tooLargeStatus(size: Pick<ExtractionOutputSize, "width" | "height">): string {
+    return `Texture too large to finalize ${size.width} x ${size.height}`;
+  }
+
+  function reportOversizedExtractions(skipped: ExtractionJob[], selectedRipperSnapshot?: string) {
+    if (skipped.length === 0) return;
+    const selected = selectedRipperSnapshot
+      ? skipped.find((job) => job.ripper.id === selectedRipperSnapshot)
+      : undefined;
+    const largest = skipped.reduce((best, job) =>
+      job.outputSize.pixels > best.outputSize.pixels ? job : best, skipped[0]!);
+    const job = selected ?? largest;
+    const suffix = skipped.length > 1 ? ` (${skipped.length} oversized rippers skipped)` : "";
+    setStatus(`${tooLargeStatus(job.outputSize)}${suffix}`);
+  }
+
+  function applyExtraction(extracted: ResolvedExtraction[]) {
     if (extracted.length === 0) return;
 
     setAtlasImages((current) => {
@@ -652,8 +774,6 @@ export function App(): ReactElement {
       return outputImageId && ripper.outputImageId !== outputImageId ? { ...ripper, outputImageId } : ripper;
     }));
 
-    const selectedOutput = selectedRipperSnapshot ? outputByRipper.get(selectedRipperSnapshot) : undefined;
-    if (selectedOutput) setSelectedAtlasImageId(selectedOutput);
     setStatus(`Auto extracted ${extracted.length} texture${extracted.length === 1 ? "" : "s"}`);
   }
 
@@ -665,10 +785,31 @@ export function App(): ReactElement {
     sourceSnapshot: WorkspaceImageState[],
     selectedRipperSnapshot?: string
   ) {
-    const { sourceItems, jobs } = buildExtractionInputs(ripperSnapshot, sourceSnapshot);
+    if (autoExtractRun.current !== runId) {
+      recordStaleExtractionSkipped();
+      return;
+    }
+    const { sourceItems, jobs, skipped } = buildExtractionInputs(ripperSnapshot, sourceSnapshot);
+    if (jobs.length === 0) {
+      reportOversizedExtractions(skipped, selectedRipperSnapshot);
+      return;
+    }
+    // Large readbacks can still stall while their buffers are realized on the UI
+    // thread. Keep the synchronous GPU path for small instant updates, and send
+    // larger auto-bakes through the worker instead.
+    if (jobs.some((job) => job.outputSize.pixels > GPU_COMMIT_PIXEL_LIMIT)) {
+      void autoExtractRippers(runId, ripperSnapshot, sourceSnapshot, selectedRipperSnapshot);
+      return;
+    }
     const extracted: ResolvedExtraction[] = [];
     for (const job of jobs) {
+      if (autoExtractRun.current !== runId) {
+        recordStaleExtractionSkipped();
+        return;
+      }
+      const started = performance.now();
       const result = gpuExtractPerspective(job.ripper, sourceItems);
+      recordSyncExtraction(performance.now() - started);
       if (result) extracted.push({ ...job, result });
     }
     if (autoExtractRun.current !== runId) return;
@@ -678,7 +819,8 @@ export function App(): ReactElement {
       void autoExtractRippers(runId, ripperSnapshot, sourceSnapshot, selectedRipperSnapshot);
       return;
     }
-    applyExtraction(extracted, selectedRipperSnapshot);
+    applyExtraction(extracted);
+    reportOversizedExtractions(skipped, selectedRipperSnapshot);
   }
 
   async function autoExtractRippers(
@@ -687,7 +829,11 @@ export function App(): ReactElement {
     sourceSnapshot: WorkspaceImageState[],
     selectedRipperSnapshot?: string
   ) {
-    const { sourceItems, jobs } = buildExtractionInputs(ripperSnapshot, sourceSnapshot);
+    const { sourceItems, jobs, skipped } = buildExtractionInputs(ripperSnapshot, sourceSnapshot);
+    if (jobs.length === 0) {
+      reportOversizedExtractions(skipped, selectedRipperSnapshot);
+      return;
+    }
     const settled = await Promise.allSettled(jobs.map(async (job) => ({
       ...job,
       result: await runWorker<ExtractionResult | null>({
@@ -702,7 +848,8 @@ export function App(): ReactElement {
       .filter((item): item is PromiseFulfilledResult<typeof jobs[number] & { result: ExtractionResult | null }> => item.status === "fulfilled")
       .map((item) => item.value)
       .filter((item): item is ResolvedExtraction => item.result !== null);
-    applyExtraction(extracted, selectedRipperSnapshot);
+    applyExtraction(extracted);
+    reportOversizedExtractions(skipped, selectedRipperSnapshot);
   }
 
   // Bake the current adjustments into the selected texture (from its untouched
@@ -711,7 +858,7 @@ export function App(): ReactElement {
     const image = selectedAtlasImage;
     if (!image) return;
     commitHistory();
-    livePreviewRef.current = null;
+    setLivePreview(null);
     setStatus("Applying adjustments...");
     const result = await runWorker<PixelImage>({ type: "adjust", image: image.originalImage, settings: image.settings });
     setAtlasImages((current) => current.map((item) => item.id === image.id
@@ -727,7 +874,7 @@ export function App(): ReactElement {
     const source = selectedAtlasImage;
     if (!source || atlasImages.length === 0) return;
     commitHistory();
-    livePreviewRef.current = null;
+    setLivePreview(null);
     const settings = source.settings;
     setStatus(`Applying to ${atlasImages.length} texture${atlasImages.length === 1 ? "" : "s"}...`);
     const baked = await Promise.all(atlasImages.map(async (item) => ({
@@ -790,7 +937,7 @@ export function App(): ReactElement {
   function deleteSourceImage(id = selectedSourceImageId) {
     if (!id || !sourceImages.some((image) => image.id === id)) return;
     commitHistory();
-    livePreviewRef.current = null;
+    setLivePreview(null);
     setImageMenu(null);
     setSourceImages((current) => current.filter((image) => image.id !== id));
     if (selectedSourceImageId === id) setSelectedSourceImageId(undefined);
@@ -800,7 +947,7 @@ export function App(): ReactElement {
   function deleteAtlasImage(id = selectedAtlasImageId) {
     if (!id || !atlasImages.some((image) => image.id === id)) return;
     commitHistory();
-    livePreviewRef.current = null;
+    setLivePreview(null);
     setImageMenu(null);
     setAtlasImages((current) => current.filter((image) => image.id !== id));
     setRippers((current) => current.map((ripper) => ripper.outputImageId === id
@@ -976,7 +1123,7 @@ export function App(): ReactElement {
     const edited = rippers.find((item) => item.id === id);
     editStartSignatureRef.current = edited ? ripperSignature(edited) : null;
     // Show the last committed pixels until the first live frame is rendered.
-    livePreviewRef.current = null;
+    setLivePreview(null);
   }
 
   function onRipperEditEnd() {
@@ -995,10 +1142,10 @@ export function App(): ReactElement {
     const edited = rippers.find((item) => item.id === editedId);
     const unchanged = edited != null && startSignature != null && ripperSignature(edited) === startSignature;
     if (unchanged) {
-      livePreviewRef.current = null;
+      setLivePreview(null);
       return;
     }
-    void commitRipper(editedId, rippers, sourceImages, selectedRipperId);
+    void commitRipper(editedId, rippers, sourceImages);
   }
 
   // Moving a placed image is a single undo step: snapshot at pointer-down,
@@ -1019,8 +1166,7 @@ export function App(): ReactElement {
   async function commitRipper(
     ripperId: string,
     ripperSnapshot: RipperState[],
-    sourceSnapshot: WorkspaceImageState[],
-    selectedRipperSnapshot?: string
+    sourceSnapshot: WorkspaceImageState[]
   ) {
     const index = ripperSnapshot.findIndex((item) => item.id === ripperId);
     const ripper = ripperSnapshot[index];
@@ -1030,31 +1176,44 @@ export function App(): ReactElement {
     autoExtractRun.current = runId;
 
     let result: ExtractionResult | null = null;
-    if (isGpuExtractAvailable()) {
-      result = await gpuExtractPerspectiveAsync(ripper, toPlacedImages(sourceSnapshot));
+    const started = performance.now();
+    const outputSize = extractionOutputSize(ripper);
+    if (outputSize.pixels > MAX_COMMIT_PIXEL_LIMIT) {
+      setLivePreview(null);
+      setStatus(tooLargeStatus(outputSize));
+      return;
+    }
+    const useGpuCommit = isGpuExtractAvailable() && outputSize.pixels <= GPU_COMMIT_PIXEL_LIMIT;
+    if (useGpuCommit) {
+      result = gpuExtractPerspective(ripper, toPlacedImages(sourceSnapshot));
     } else {
+      if (outputSize.pixels > GPU_COMMIT_PIXEL_LIMIT) {
+        setStatus(`Finalizing large texture ${outputSize.width} x ${outputSize.height}...`);
+      }
       result = await runWorker<ExtractionResult | null>({
         type: "extract",
         ripper,
         images: toPlacedImages(sourceSnapshot)
       });
     }
+    recordAsyncCommit(performance.now() - started);
     if (autoExtractRun.current !== runId) return;
 
     if (result) {
       const outputImageId = ripper.outputImageId ?? createId("atlas");
-      applyExtraction([{ ripper, index, outputImageId, result }], selectedRipperSnapshot);
+      applyExtraction([{ ripper, index, outputImageId, outputSize, result }]);
     }
 
-    // Drop the live preview once the committed texture has had a frame or two to
-    // render. Guard against a new drag having started in the meantime.
+    // Usually the atlas workspace clears this as soon as its async display cache
+    // is ready. Keep a fallback so a failed cache build cannot leave a stale
+    // live canvas stuck forever.
     const previewImageId = livePreviewRef.current?.imageId;
     if (previewImageId) {
-      window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
+      window.setTimeout(() => {
         if (editingRipperIdRef.current === null && livePreviewRef.current?.imageId === previewImageId) {
-          livePreviewRef.current = null;
+          setLivePreview(null);
         }
-      }));
+      }, 2000);
     }
   }
 
@@ -1130,6 +1289,7 @@ export function App(): ReactElement {
               selectedImageId={selectedAtlasImageId}
               view={atlasView}
               livePreview={livePreviewRef}
+              onLivePreviewCached={clearLivePreviewIfCached}
               onViewChange={setAtlasView}
               onSelectImage={selectAtlasImage}
               onMoveImage={moveAtlasImage}
@@ -1246,11 +1406,12 @@ export function App(): ReactElement {
 }
 
 function makeWorkspaceImage(name: string, image: PixelImage, position: Vec2, isAtlas: boolean, id = createId(isAtlas ? "atlas" : "source")): WorkspaceImageState {
+  const storedImage = cloneForState(image);
   return {
     id,
     name,
-    image: cloneForState(image),
-    originalImage: cloneForState(image),
+    image: storedImage,
+    originalImage: isAtlas ? cloneForState(image) : storedImage,
     position,
     scale: { x: 1, y: 1 },
     rotation: 0,

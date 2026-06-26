@@ -1,8 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactElement } from "react";
+import { defaultTextureAdjustments } from "@dinorip/core";
 import type { PixelImage, Vec2 } from "@dinorip/core";
 import type { TextureSettings } from "../renderer/types";
-import { pixelImageToCanvas } from "../renderer/imageCanvas";
+import {
+  disposePixelImageSource,
+  pixelImageToImageSource,
+  type PixelImageSource
+} from "../renderer/imageCanvas";
+import { recordTexturePreviewBuild, recordTexturePreviewJob } from "../renderer/perf";
 
 interface TexturePreviewProps {
   // The unedited source texture; adjustments are applied on top so the preview
@@ -16,6 +22,8 @@ interface TexturePreviewProps {
 
 // Hold off recomputing while a slider is still being dragged.
 const PREVIEW_DEBOUNCE_MS = 90;
+const PREVIEW_MAX_SIZE = 768;
+const PREVIEW_PIXEL_LIMIT = 300_000;
 const MIN_ZOOM = 1;
 const MAX_ZOOM = 8;
 const ZOOM_STEP = 1.15;
@@ -27,8 +35,10 @@ export function TexturePreview({ image, settings, version, computeAdjusted }: Te
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   // The image actually painted: the raw texture at first, replaced by the
   // adjusted result once the (debounced) worker job returns.
-  const sourceCanvas = useRef<HTMLCanvasElement | null>(null);
+  const sourceCanvas = useRef<PixelImageSource | null>(null);
   const drawnImage = useRef<PixelImage | null>(null);
+  const drawnVersion = useRef<number | null>(null);
+  const sourceKey = useRef("");
   const zoom = useRef(1);
   const offset = useRef<Vec2>({ x: 0, y: 0 });
   const panning = useRef<Vec2 | null>(null);
@@ -43,32 +53,109 @@ export function TexturePreview({ image, settings, version, computeAdjusted }: Te
   useEffect(() => {
     const runId = requestId.current + 1;
     requestId.current = runId;
+    const timers: number[] = [];
+    let cancelled = false;
+    let rawQueued = false;
+    const rawKey = `raw:${version}`;
 
-    // On a texture swap, paint the raw texture immediately so selecting feels
-    // instant (and reset the view); on a pure setting change keep the last frame
-    // to avoid flicker. The worker refines to the adjusted result below.
-    if (drawnImage.current !== image) {
+    const setPreviewSource = (key: string, source: PixelImageSource) => {
+      if (cancelled || requestId.current !== runId) {
+        disposePixelImageSource(source);
+        return;
+      }
+      disposePixelImageSource(sourceCanvas.current);
+      sourceCanvas.current = source;
+      sourceKey.current = key;
+      drawPreview(canvasRef.current, sourceCanvas.current, zoom.current, offset.current);
+    };
+
+    const queuePreviewBuild = (sourceImage: PixelImage, key: string, delayMs = 0) => {
+      const timer = window.setTimeout(() => {
+        const started = performance.now();
+        void pixelImageToImageSource(sourceImage, { maxSize: PREVIEW_MAX_SIZE })
+          .then((source) => {
+            recordTexturePreviewBuild(performance.now() - started);
+            setPreviewSource(key, source);
+          })
+          .catch(() => {
+            // Leave the last good frame showing if preview source creation fails.
+          });
+      }, delayMs);
+      timers.push(timer);
+    };
+
+    if (image.width * image.height > PREVIEW_PIXEL_LIMIT) {
       drawnImage.current = image;
+      drawnVersion.current = version;
       zoom.current = 1;
       offset.current = { x: 0, y: 0 };
-      sourceCanvas.current = pixelImageToCanvas(image);
+      disposePixelImageSource(sourceCanvas.current);
+      sourceCanvas.current = null;
+      sourceKey.current = `skipped:${version}`;
       drawPreview(canvasRef.current, sourceCanvas.current, zoom.current, offset.current);
+      return () => {
+        cancelled = true;
+        timers.forEach((timer) => window.clearTimeout(timer));
+      };
     }
 
+    // On a texture swap, paint the raw texture immediately so selecting feels
+    // instant (and reset the view); the actual bitmap is built asynchronously so
+    // selecting a huge atlas texture cannot lock the main thread.
+    if (drawnImage.current !== image || drawnVersion.current !== version) {
+      drawnImage.current = image;
+      drawnVersion.current = version;
+      zoom.current = 1;
+      offset.current = { x: 0, y: 0 };
+      disposePixelImageSource(sourceCanvas.current);
+      sourceCanvas.current = null;
+      sourceKey.current = "";
+      drawPreview(canvasRef.current, sourceCanvas.current, zoom.current, offset.current);
+      queuePreviewBuild(image, rawKey);
+      rawQueued = true;
+    }
+
+    if (settingsAreDefault(settings)) {
+      if (sourceKey.current !== rawKey && !rawQueued) queuePreviewBuild(image, rawKey);
+      return () => {
+        cancelled = true;
+        timers.forEach((timer) => window.clearTimeout(timer));
+      };
+    }
+
+    const adjustedKey = `adjusted:${version}:${settingsKey}`;
     const timer = window.setTimeout(() => {
+      const started = performance.now();
       void computeAdjusted(image, settings)
         .then((result) => {
+          recordTexturePreviewJob(performance.now() - started);
           if (requestId.current !== runId) return;
-          sourceCanvas.current = pixelImageToCanvas(result);
-          drawPreview(canvasRef.current, sourceCanvas.current, zoom.current, offset.current);
+          const buildStarted = performance.now();
+          void pixelImageToImageSource(result, { maxSize: PREVIEW_MAX_SIZE })
+            .then((source) => {
+              recordTexturePreviewBuild(performance.now() - buildStarted);
+              setPreviewSource(adjustedKey, source);
+            })
+            .catch(() => {
+              // Leave the last good frame showing if preview source creation fails.
+            });
         })
         .catch(() => {
           // Leave the last good frame showing if the adjustment fails.
         });
     }, PREVIEW_DEBOUNCE_MS);
+    timers.push(timer);
 
-    return () => window.clearTimeout(timer);
+    return () => {
+      cancelled = true;
+      timers.forEach((queuedTimer) => window.clearTimeout(queuedTimer));
+    };
   }, [image, version, settingsKey, computeAdjusted]);
+
+  useEffect(() => () => {
+    disposePixelImageSource(sourceCanvas.current);
+    sourceCanvas.current = null;
+  }, []);
 
   // Redraw on container resizes.
   useEffect(() => {
@@ -130,9 +217,14 @@ export function TexturePreview({ image, settings, version, computeAdjusted }: Te
   );
 }
 
+function settingsAreDefault(settings: TextureSettings): boolean {
+  return Object.entries(defaultTextureAdjustments).every(([key, value]) =>
+    settings[key as keyof TextureSettings] === value);
+}
+
 function drawPreview(
   canvas: HTMLCanvasElement | null,
-  source: HTMLCanvasElement | null,
+  source: PixelImageSource | null,
   zoom: number,
   offset: Vec2
 ) {

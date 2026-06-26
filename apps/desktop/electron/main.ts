@@ -77,6 +77,7 @@ function createWindow(): void {
     titleBarStyle: isMac ? "hidden" : "default",
     ...(isMac ? { trafficLightPosition: { x: 10, y: 4 } } : {}),
     webPreferences: {
+      backgroundThrottling: false,
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
