@@ -1,7 +1,9 @@
-import { app, BrowserWindow, nativeImage, shell } from "electron";
+import { app, BrowserWindow, Menu, nativeImage, shell } from "electron";
+import type { MenuItemConstructorOptions } from "electron";
 import path from "node:path";
 import sharp from "sharp";
 import { registerIpc } from "./ipc";
+import type { MenuCommand } from "@dinorip/ipc-contracts";
 
 // Set before the app is ready so the menu bar, About panel, and userData path
 // all use the product name instead of Electron's default. (Packaged builds get
@@ -9,6 +11,84 @@ import { registerIpc } from "./ipc";
 app.setName("DinoRip");
 
 let mainWindow: BrowserWindow | null = null;
+
+const MENU_CHANNEL = "dinorip:menu-command";
+
+function sendMenuCommand(command: MenuCommand): void {
+  mainWindow?.webContents.send(MENU_CHANNEL, command);
+}
+
+function installApplicationMenu(): void {
+  const isMac = process.platform === "darwin";
+  const template: MenuItemConstructorOptions[] = [
+    ...(isMac
+      ? [{
+          label: app.name,
+          submenu: [
+            { role: "about" },
+            { type: "separator" },
+            { role: "services" },
+            { type: "separator" },
+            { role: "hide" },
+            { role: "hideOthers" },
+            { role: "unhide" },
+            { type: "separator" },
+            { role: "quit" }
+          ]
+        } satisfies MenuItemConstructorOptions]
+      : []),
+    {
+      label: "File",
+      submenu: [
+        { label: "Open Project...", accelerator: "CmdOrCtrl+O", click: () => sendMenuCommand("open-project") },
+        { label: "Save Project...", accelerator: "CmdOrCtrl+S", click: () => sendMenuCommand("save-project") },
+        { type: "separator" },
+        { label: "Load Image...", accelerator: "CmdOrCtrl+Shift+O", click: () => sendMenuCommand("load-image") },
+        { type: "separator" },
+        { label: "Export Selected Texture...", click: () => sendMenuCommand("export-selected") },
+        { label: "Export All Textures...", click: () => sendMenuCommand("export-all") },
+        { label: "Export Atlas...", click: () => sendMenuCommand("export-atlas") },
+        { type: "separator" },
+        isMac ? { role: "close" } : { role: "quit" }
+      ]
+    },
+    {
+      label: "Edit",
+      submenu: [
+        { label: "Undo", accelerator: "CmdOrCtrl+Z", click: () => sendMenuCommand("undo") },
+        { label: "Redo", accelerator: isMac ? "Shift+Cmd+Z" : "Ctrl+Y", click: () => sendMenuCommand("redo") },
+        { type: "separator" },
+        { role: "cut" },
+        { role: "copy" },
+        { role: "paste" },
+        { type: "separator" },
+        { label: "Select All", accelerator: "CmdOrCtrl+A", click: () => sendMenuCommand("select-all") }
+      ]
+    },
+    {
+      label: "View",
+      submenu: [
+        { label: "Toggle Full Screen", accelerator: "CmdOrCtrl+F", click: () => sendMenuCommand("toggle-fullscreen") },
+        ...(app.isPackaged ? [] : [
+          { type: "separator" } as MenuItemConstructorOptions,
+          { role: "reload" } as MenuItemConstructorOptions,
+          { role: "toggleDevTools" } as MenuItemConstructorOptions
+        ])
+      ]
+    },
+    { role: "windowMenu" },
+    {
+      role: "help",
+      submenu: [
+        {
+          label: "DinoRip on GitHub",
+          click: () => void shell.openExternal("https://github.com/maria-rcks/dinorip")
+        }
+      ]
+    }
+  ];
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
 
 // The runtime/Dock icon uses the pre-rounded squircle: macOS does not
 // auto-squircle a programmatically-set Dock icon (unlike a packaged app's
@@ -122,6 +202,7 @@ app.whenReady().then(async () => {
   // Register IPC once for the app lifetime; handlers resolve the current window
   // lazily, so re-creating the window on macOS does not double-register.
   registerIpc(() => mainWindow);
+  installApplicationMenu();
   createWindow();
 
   app.on("activate", () => {

@@ -2,7 +2,10 @@ export const IPC_CHANNELS = {
   openImages: "dinorip:open-images",
   savePng: "dinorip:save-png",
   exportAllPng: "dinorip:export-all-png",
-  toggleFullscreen: "dinorip:toggle-fullscreen"
+  saveProject: "dinorip:save-project",
+  openProject: "dinorip:open-project",
+  toggleFullscreen: "dinorip:toggle-fullscreen",
+  menuCommand: "dinorip:menu-command"
 } as const;
 
 export interface IpcPixelImage {
@@ -35,12 +38,39 @@ export interface SaveResult {
   paths: string[];
 }
 
+export interface SaveProjectRequest {
+  defaultName: string;
+  path?: string;
+  contents: string;
+}
+
+export interface OpenProjectResult {
+  canceled: boolean;
+  path?: string;
+  contents?: string;
+}
+
+export type MenuCommand =
+  | "open-project"
+  | "save-project"
+  | "load-image"
+  | "export-selected"
+  | "export-all"
+  | "export-atlas"
+  | "select-all"
+  | "undo"
+  | "redo"
+  | "toggle-fullscreen";
+
 export interface DinoripApi {
   /** Host platform string from the main process (e.g. "darwin", "win32"). */
   platform: string;
   openImages(): Promise<OpenImagesResult>;
   savePng(request: SavePngRequest): Promise<SaveResult>;
   exportAllPng(request: ExportAllPngRequest): Promise<SaveResult>;
+  saveProject(request: SaveProjectRequest): Promise<SaveResult>;
+  openProject(): Promise<OpenProjectResult>;
+  onMenuCommand(handler: (command: MenuCommand) => void): () => void;
   toggleFullscreen(): Promise<boolean>;
 }
 

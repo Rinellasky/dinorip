@@ -7,8 +7,10 @@ import type * as Contracts from "@dinorip/ipc-contracts";
 import type {
   ExportAllPngRequest,
   IpcPixelImage,
+  OpenProjectResult,
   OpenImagesResult,
   SavePngRequest,
+  SaveProjectRequest,
   SaveResult
 } from "@dinorip/ipc-contracts";
 
@@ -20,10 +22,15 @@ const IPC_CHANNELS = {
   openImages: "dinorip:open-images",
   savePng: "dinorip:save-png",
   exportAllPng: "dinorip:export-all-png",
-  toggleFullscreen: "dinorip:toggle-fullscreen"
+  saveProject: "dinorip:save-project",
+  openProject: "dinorip:open-project",
+  toggleFullscreen: "dinorip:toggle-fullscreen",
+  menuCommand: "dinorip:menu-command"
 } as const satisfies typeof Contracts.IPC_CHANNELS;
 
 const imageFilters = [{ name: "Images", extensions: ["png", "jpg", "jpeg"] }];
+const projectFilters = [{ name: "DinoRip Project", extensions: ["dr"] }];
+let currentProjectPath: string | undefined;
 
 /**
  * Registers IPC handlers exactly once. Handlers resolve the active window
@@ -97,6 +104,51 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
     return { canceled: false, paths };
   });
 
+  ipcMain.handle(IPC_CHANNELS.saveProject, async (_event, request: SaveProjectRequest): Promise<SaveResult> => {
+    const knownPath = request.path ?? currentProjectPath;
+    if (knownPath) {
+      const filePath = ensureProjectName(knownPath);
+      await fs.writeFile(filePath, request.contents, "utf8");
+      currentProjectPath = filePath;
+      return { canceled: false, paths: [filePath] };
+    }
+
+    const result = await showSave(getWindow(), {
+      title: "Save Project",
+      defaultPath: ensureProjectName(request.defaultName),
+      filters: projectFilters
+    });
+
+    if (result.canceled || !result.filePath) {
+      return { canceled: true, paths: [] };
+    }
+
+    const filePath = ensureProjectName(result.filePath);
+    await fs.writeFile(filePath, request.contents, "utf8");
+    currentProjectPath = filePath;
+    return { canceled: false, paths: [filePath] };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.openProject, async (): Promise<OpenProjectResult> => {
+    const result = await showOpen(getWindow(), {
+      title: "Open Project",
+      filters: projectFilters,
+      properties: ["openFile"]
+    });
+
+    if (result.canceled || result.filePaths.length === 0 || !result.filePaths[0]) {
+      return { canceled: true };
+    }
+
+    const filePath = result.filePaths[0];
+    currentProjectPath = filePath;
+    return {
+      canceled: false,
+      path: filePath,
+      contents: await fs.readFile(filePath, "utf8")
+    };
+  });
+
   ipcMain.handle(IPC_CHANNELS.toggleFullscreen, (): boolean => {
     const window = getWindow();
     if (!window) return false;
@@ -156,4 +208,8 @@ async function encodePngToFile(image: IpcPixelImage, filePath: string): Promise<
 
 function ensurePngName(name: string): string {
   return name.toLowerCase().endsWith(".png") ? name : `${name}.png`;
+}
+
+function ensureProjectName(name: string): string {
+  return name.toLowerCase().endsWith(".dr") ? name : `${name}.dr`;
 }

@@ -9,6 +9,9 @@ if (!window.dinorip) {
     openImages: async () => ({ canceled: true, images: [] }),
     savePng: async () => ({ canceled: true, paths: [] }),
     exportAllPng: async () => ({ canceled: true, paths: [] }),
+    saveProject: async () => ({ canceled: true, paths: [] }),
+    openProject: async () => ({ canceled: true }),
+    onMenuCommand: () => () => {},
     toggleFullscreen: async () => false
   };
 }

@@ -1,6 +1,12 @@
 import { contextBridge, ipcRenderer } from "electron";
 import type * as Contracts from "@dinorip/ipc-contracts";
-import type { ExportAllPngRequest, SavePngRequest, DinoripApi } from "@dinorip/ipc-contracts";
+import type {
+  DinoripApi,
+  ExportAllPngRequest,
+  MenuCommand,
+  SavePngRequest,
+  SaveProjectRequest
+} from "@dinorip/ipc-contracts";
 
 // The channel literals are intentionally inlined. A sandboxed preload
 // (sandbox: true) can only require "electron" plus a few Node builtins, so
@@ -12,7 +18,10 @@ const CHANNELS = {
   openImages: "dinorip:open-images",
   savePng: "dinorip:save-png",
   exportAllPng: "dinorip:export-all-png",
-  toggleFullscreen: "dinorip:toggle-fullscreen"
+  saveProject: "dinorip:save-project",
+  openProject: "dinorip:open-project",
+  toggleFullscreen: "dinorip:toggle-fullscreen",
+  menuCommand: "dinorip:menu-command"
 } as const satisfies typeof Contracts.IPC_CHANNELS;
 
 const api: DinoripApi = {
@@ -20,6 +29,13 @@ const api: DinoripApi = {
   openImages: () => ipcRenderer.invoke(CHANNELS.openImages),
   savePng: (request: SavePngRequest) => ipcRenderer.invoke(CHANNELS.savePng, request),
   exportAllPng: (request: ExportAllPngRequest) => ipcRenderer.invoke(CHANNELS.exportAllPng, request),
+  saveProject: (request: SaveProjectRequest) => ipcRenderer.invoke(CHANNELS.saveProject, request),
+  openProject: () => ipcRenderer.invoke(CHANNELS.openProject),
+  onMenuCommand: (handler: (command: MenuCommand) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, command: MenuCommand) => handler(command);
+    ipcRenderer.on(CHANNELS.menuCommand, listener);
+    return () => ipcRenderer.removeListener(CHANNELS.menuCommand, listener);
+  },
   toggleFullscreen: () => ipcRenderer.invoke(CHANNELS.toggleFullscreen)
 };
 

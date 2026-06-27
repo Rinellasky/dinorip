@@ -52,7 +52,9 @@ interface CanvasWorkspaceProps {
   images: WorkspaceImageState[];
   rippers?: RipperState[];
   selectedImageId?: string;
+  selectedImageIds?: string[];
   selectedRipperId?: string;
+  selectedRipperIds?: string[];
   view: ViewState;
   // Mutable ref holding the live GPU projection to draw in place of a cached
   // image while a ripper is being dragged. Read every animation frame, so
@@ -62,13 +64,17 @@ interface CanvasWorkspaceProps {
   onViewChange(view: ViewState): void;
   onSelectImage(id?: string): void;
   onSelectRipper?(id?: string): void;
+  onSelectRippers?(ids: string[]): void;
   // Absolute world-space position the image's centre should move to. Atlas
   // snapping is resolved by the canvas before this is called.
   onMoveImage(id: string, position: Vec2): void;
+  onMoveImages?(updates: Array<{ id: string; position: Vec2 }>): void;
   onScaleImage(id: string, nextScale: Vec2): void;
+  onTransformImages?(updates: Array<{ id: string; position: Vec2; scale: Vec2 }>): void;
   /** Atlas only: set a texture's rotation (radians, CCW in world space). */
   onRotateImage?(id: string, rotation: number): void;
   onMoveRipper?(id: string, delta: Vec2): void;
+  onMoveRippers?(ids: string[], delta: Vec2): void;
   onMoveVertex?(id: string, index: number, point: Vec2): void;
   /** Batched corner move — used for group drags and Cmd-uniform-scaling. */
   onMoveVertices?(updates: VertexUpdate[]): void;
@@ -78,7 +84,7 @@ interface CanvasWorkspaceProps {
   onRemoveEdgeCurve?(id: string, edge: number): void;
   /** Right-click on an image (atlas): reports the image under the cursor (or undefined). */
   onImageContextMenu?(id: string | undefined, clientX: number, clientY: number): void;
-  onRipperEditStart?(id: string): void;
+  onRipperEditStart?(id: string, editedIds?: string[]): void;
   onRipperEditEnd?(): void;
   onImageEditStart?(id: string): void;
   onImageEditEnd?(): void;
@@ -106,15 +112,15 @@ type DragState =
   // frame and the image stuck to that edge until the cursor cleared the band in
   // a single frame. From a stable anchor the unsnapped target always tracks the
   // cursor, so snapping engages and releases cleanly.
-  | { type: "image"; id: string; startWorld: Vec2; startPos: Vec2 }
+  | { type: "image"; id: string; ids: string[]; startWorld: Vec2; startPositions: Record<string, Vec2> }
   // Resizing the selected atlas texture from a corner or edge handle. `anchor`
   // is the fixed point (opposite corner, or opposite edge midpoint) in world
   // space; `startScale` is the scale at grab time so a Shift-held proportional
   // resize can preserve the texture's aspect ratio.
-  | { type: "resize"; id: string; mode: ResizeMode; anchor: Vec2; startScale: Vec2 }
+  | { type: "resize"; id: string; ids: string[]; mode: ResizeMode; anchor: Vec2; startScale: Vec2; startImages: Record<string, { position: Vec2; scale: Vec2 }> }
   // Rotating the selected atlas texture around its centre via the stem handle.
   | { type: "rotate"; id: string; center: Vec2 }
-  | { type: "ripper"; id: string; lastWorld: Vec2 }
+  | { type: "ripper"; id: string; ids: string[]; lastWorld: Vec2 }
   // A corner drag. `startWorld`/`startPoints` snapshot the moment the drag began
   // so Cmd-scaling and group moves can be recomputed from a stable baseline
   // (letting Cmd be toggled mid-drag). `group` is every corner that moves with
@@ -168,6 +174,14 @@ export function CanvasWorkspace(props: CanvasWorkspaceProps): ReactElement {
   const selectedImage = useMemo(
     () => props.images.find((image) => image.id === props.selectedImageId),
     [props.images, props.selectedImageId]
+  );
+  const selectedImageIds = useMemo(
+    () => props.selectedImageIds ?? (props.selectedImageId ? [props.selectedImageId] : []),
+    [props.selectedImageId, props.selectedImageIds]
+  );
+  const selectedRipperIds = useMemo(
+    () => props.selectedRipperIds ?? (props.selectedRipperId ? [props.selectedRipperId] : []),
+    [props.selectedRipperId, props.selectedRipperIds]
   );
 
   const renderNow = (time = performance.now()) => {
@@ -267,7 +281,18 @@ export function CanvasWorkspace(props: CanvasWorkspaceProps): ReactElement {
         return;
       }
       if (control && control.anchor && control.mode) {
-        dragRef.current = { type: "resize", id: selectedImage.id, mode: control.mode, anchor: control.anchor, startScale: { ...selectedImage.scale } };
+        const ids = selectedImageIds.length > 1 && selectedImageIds.includes(selectedImage.id)
+          ? selectedImageIds
+          : [selectedImage.id];
+        dragRef.current = {
+          type: "resize",
+          id: selectedImage.id,
+          ids,
+          mode: control.mode,
+          anchor: control.anchor,
+          startScale: { ...selectedImage.scale },
+          startImages: snapshotImageStates(props.images, ids)
+        };
         props.onImageEditStart?.(selectedImage.id);
         setCanvasCursor(canvas, control.cursor);
         return;
@@ -290,11 +315,13 @@ export function CanvasWorkspace(props: CanvasWorkspaceProps): ReactElement {
         dragRef.current = { type: "none" };
         return;
       }
-      // Grabbing a corner that is part of the selection drags the whole group;
-      // grabbing any other corner drops the selection and drags just that one.
-      const inSelection = selectedVertices.has(key) && selectedVertices.size > 1;
-      const group = inSelection ? vertexRefsFromKeys(selectedVertices) : [{ id: vertexHit.ripper.id, index: vertexHit.index }];
-      if (!inSelection && selectedVertices.size > 0) setSelectedVertices(new Set());
+      // Grabbing a Shift-selected corner drags that explicit corner group.
+      // Ripper multi-selection does not imply "same corner on every ripper".
+      const inVertexSelection = selectedVertices.has(key) && selectedVertices.size > 1;
+      const group = inVertexSelection
+        ? vertexRefsFromKeys(selectedVertices)
+        : [{ id: vertexHit.ripper.id, index: vertexHit.index }];
+      if (!inVertexSelection && selectedVertices.size > 0) setSelectedVertices(new Set());
       dragRef.current = {
         type: "vertex",
         id: vertexHit.ripper.id,
@@ -307,7 +334,7 @@ export function CanvasWorkspace(props: CanvasWorkspaceProps): ReactElement {
           curve ? ([{ ...curve[0] }, { ...curve[1] }] as const) : null),
         group
       };
-      props.onRipperEditStart?.(vertexHit.ripper.id);
+      props.onRipperEditStart?.(vertexHit.ripper.id, uniqueIds(group.map((item) => item.id)));
       setCanvasCursor(canvas, "pointer");
       return;
     }
@@ -326,7 +353,7 @@ export function CanvasWorkspace(props: CanvasWorkspaceProps): ReactElement {
         which: curveHit.which,
         other: controls[curveHit.which === 0 ? 1 : 0]
       };
-      props.onRipperEditStart?.(curveHit.ripper.id);
+      props.onRipperEditStart?.(curveHit.ripper.id, [curveHit.ripper.id]);
       setCanvasCursor(canvas, "pointer");
       return;
     }
@@ -341,7 +368,7 @@ export function CanvasWorkspace(props: CanvasWorkspaceProps): ReactElement {
         const p0 = edgeHit.ripper.points[edgeHit.edge]!;
         const p3 = edgeHit.ripper.points[(edgeHit.edge + 1) % 4]!;
         dragRef.current = { type: "createCurve", id: edgeHit.ripper.id, edge: edgeHit.edge, p0, p3 };
-        props.onRipperEditStart?.(edgeHit.ripper.id);
+        props.onRipperEditStart?.(edgeHit.ripper.id, [edgeHit.ripper.id]);
         props.onSetEdgeCurve(edgeHit.ripper.id, edgeHit.edge, quadraticToCubic(p0, p3, world));
         setCanvasCursor(canvas, "pointer");
         return;
@@ -350,20 +377,32 @@ export function CanvasWorkspace(props: CanvasWorkspaceProps): ReactElement {
 
     const ripperHit = hitRipper(world, rippers);
     if (ripperHit && props.onMoveRipper && props.onSelectRipper) {
-      props.onSelectRipper(ripperHit.id);
+      const groupIds = selectedRipperIds.length > 1 && selectedRipperIds.includes(ripperHit.id)
+        ? selectedRipperIds
+        : [ripperHit.id];
+      if (groupIds.length === 1) props.onSelectRipper(ripperHit.id);
       if (selectedVertices.size > 0) setSelectedVertices(new Set());
-      dragRef.current = { type: "ripper", id: ripperHit.id, lastWorld: world };
-      props.onRipperEditStart?.(ripperHit.id);
+      dragRef.current = { type: "ripper", id: ripperHit.id, ids: groupIds, lastWorld: world };
+      props.onRipperEditStart?.(ripperHit.id, groupIds);
       setCanvasCursor(canvas, "grabbing");
       return;
     }
 
     const imageHit = hitImage(world, props.images);
     if (imageHit) {
-      props.onSelectImage(imageHit.id);
+      const groupIds = selectedImageIds.length > 1 && selectedImageIds.includes(imageHit.id)
+        ? selectedImageIds
+        : [imageHit.id];
+      if (groupIds.length === 1) props.onSelectImage(imageHit.id);
       const shouldDrag = props.kind === "atlas" || event.shiftKey;
       if (shouldDrag) {
-        dragRef.current = { type: "image", id: imageHit.id, startWorld: world, startPos: imageHit.position };
+        dragRef.current = {
+          type: "image",
+          id: imageHit.id,
+          ids: groupIds,
+          startWorld: world,
+          startPositions: snapshotImagePositions(props.images, groupIds)
+        };
         props.onImageEditStart?.(imageHit.id);
       } else {
         dragRef.current = { type: "none" };
@@ -453,15 +492,25 @@ export function CanvasWorkspace(props: CanvasWorkspaceProps): ReactElement {
 
     if (drag.type === "ripper" && props.onMoveRipper) {
       const world = toWorld(event);
-      props.onMoveRipper(drag.id, { x: world.x - drag.lastWorld.x, y: world.y - drag.lastWorld.y });
-      dragRef.current = { type: "ripper", id: drag.id, lastWorld: world };
+      const delta = { x: world.x - drag.lastWorld.x, y: world.y - drag.lastWorld.y };
+      if (drag.ids.length > 1 && props.onMoveRippers) props.onMoveRippers(drag.ids, delta);
+      else props.onMoveRipper(drag.id, delta);
+      dragRef.current = { type: "ripper", id: drag.id, ids: drag.ids, lastWorld: world };
       return;
     }
 
     if (drag.type === "resize") {
       const image = props.images.find((item) => item.id === drag.id);
       // Shift locks the aspect ratio (proportional resize); free otherwise.
-      if (image) resizeImageToPointer(image, drag, toWorld(event), event.shiftKey, props.onMoveImage, props.onScaleImage);
+      if (image) {
+        if (drag.ids.length > 1 && props.onTransformImages) {
+          props.onTransformImages(resizeImageGroupToPointer(image, drag, toWorld(event), event.shiftKey));
+        } else {
+          const next = resizedImageToPointer(image, drag, toWorld(event), event.shiftKey);
+          props.onScaleImage(image.id, next.scale);
+          props.onMoveImage(image.id, next.position);
+        }
+      }
       return;
     }
 
@@ -478,11 +527,21 @@ export function CanvasWorkspace(props: CanvasWorkspaceProps): ReactElement {
 
     if (drag.type === "image") {
       const world = toWorld(event);
+      const delta = { x: world.x - drag.startWorld.x, y: world.y - drag.startWorld.y };
+      if (drag.ids.length > 1 && props.onMoveImages) {
+        props.onMoveImages(drag.ids.map((id) => {
+          const start = drag.startPositions[id] ?? { x: 0, y: 0 };
+          return { id, position: { x: start.x + delta.x, y: start.y + delta.y } };
+        }));
+        return;
+      }
+      const start = drag.startPositions[drag.id];
+      if (!start) return;
       // Absolute target from the grab anchor, so the image follows the cursor
       // 1:1 regardless of any snapping applied on previous frames.
       const target = {
-        x: drag.startPos.x + (world.x - drag.startWorld.x),
-        y: drag.startPos.y + (world.y - drag.startWorld.y)
+        x: start.x + delta.x,
+        y: start.y + delta.y
       };
       const next = props.kind === "atlas"
         ? snapImageToNeighbors(drag.id, target, props.images, props.view.zoom)
@@ -638,7 +697,8 @@ function drawWorkspace(
     } else {
       drawImageLoadingPlaceholder(ctx, -width / 2, -height / 2, width, height);
     }
-    if (image.id === props.selectedImageId) {
+    const selectedImageIds = props.selectedImageIds ?? (props.selectedImageId ? [props.selectedImageId] : []);
+    if (selectedImageIds.includes(image.id)) {
       ctx.strokeStyle = "#2f7d6d";
       ctx.lineWidth = 2;
       ctx.strokeRect(-width / 2, -height / 2, width, height);
@@ -647,8 +707,9 @@ function drawWorkspace(
   }
 
   if (props.rippers) {
+    const selectedRipperIds = props.selectedRipperIds ?? (props.selectedRipperId ? [props.selectedRipperId] : []);
     for (const ripper of props.rippers) {
-      drawRipper(ctx, canvas, props.view, ripper, ripper.id === props.selectedRipperId, time, selectedVertices);
+      drawRipper(ctx, canvas, props.view, ripper, selectedRipperIds.includes(ripper.id), time, selectedVertices);
     }
   }
 
@@ -973,14 +1034,12 @@ function hitImageControl(screen: Vec2, image: WorkspaceImageState, canvas: HTMLC
 // stays pinned. Work in the texture's local frame so rotated textures resize
 // along their own axes; corners drive both axes, edges drive one. Shift locks
 // the aspect ratio captured at grab time (proportional resize).
-function resizeImageToPointer(
+function resizedImageToPointer(
   image: WorkspaceImageState,
   drag: Extract<DragState, { type: "resize" }>,
   pointer: Vec2,
-  proportional: boolean,
-  onMoveImage: (id: string, position: Vec2) => void,
-  onScaleImage: (id: string, scale: Vec2) => void
-) {
+  proportional: boolean
+): { position: Vec2; scale: Vec2 } {
   const angle = image.rotation ?? 0;
   const ux = { x: Math.cos(angle), y: Math.sin(angle) };
   const uy = { x: -Math.sin(angle), y: Math.cos(angle) };
@@ -995,18 +1054,20 @@ function resizeImageToPointer(
     const mag = Math.max(IMAGE_MIN_SCALE, Math.abs(du) / imgW);
     const sign = du >= 0 ? 1 : -1;
     const half = (mag * imgW) / 2;
-    onScaleImage(image.id, { x: mag, y: drag.startScale.y });
-    onMoveImage(image.id, { x: drag.anchor.x + sign * half * ux.x, y: drag.anchor.y + sign * half * ux.y });
-    return;
+    return {
+      scale: { x: mag, y: drag.startScale.y },
+      position: { x: drag.anchor.x + sign * half * ux.x, y: drag.anchor.y + sign * half * ux.y }
+    };
   }
 
   if (drag.mode === "edge-y") {
     const mag = Math.max(IMAGE_MIN_SCALE, Math.abs(dv) / imgH);
     const sign = dv >= 0 ? 1 : -1;
     const half = (mag * imgH) / 2;
-    onScaleImage(image.id, { x: drag.startScale.x, y: mag });
-    onMoveImage(image.id, { x: drag.anchor.x + sign * half * uy.x, y: drag.anchor.y + sign * half * uy.y });
-    return;
+    return {
+      scale: { x: drag.startScale.x, y: mag },
+      position: { x: drag.anchor.x + sign * half * uy.x, y: drag.anchor.y + sign * half * uy.y }
+    };
   }
 
   let magU = Math.max(IMAGE_MIN_SCALE, Math.abs(du) / imgW);
@@ -1024,10 +1085,41 @@ function resizeImageToPointer(
   const signV = dv >= 0 ? 1 : -1;
   const halfU = (magU * imgW) / 2;
   const halfV = (magV * imgH) / 2;
-  onScaleImage(image.id, { x: magU, y: magV });
-  onMoveImage(image.id, {
-    x: drag.anchor.x + signU * halfU * ux.x + signV * halfV * uy.x,
-    y: drag.anchor.y + signU * halfU * ux.y + signV * halfV * uy.y
+  return {
+    scale: { x: magU, y: magV },
+    position: {
+      x: drag.anchor.x + signU * halfU * ux.x + signV * halfV * uy.x,
+      y: drag.anchor.y + signU * halfU * ux.y + signV * halfV * uy.y
+    }
+  };
+}
+
+function resizeImageGroupToPointer(
+  image: WorkspaceImageState,
+  drag: Extract<DragState, { type: "resize" }>,
+  pointer: Vec2,
+  proportional: boolean
+): Array<{ id: string; position: Vec2; scale: Vec2 }> {
+  const nextPrimary = resizedImageToPointer(image, drag, pointer, proportional);
+  const primaryStart = drag.startImages[drag.id];
+  if (!primaryStart) return [];
+  const factorX = primaryStart.scale.x === 0 ? 1 : nextPrimary.scale.x / primaryStart.scale.x;
+  const factorY = primaryStart.scale.y === 0 ? 1 : nextPrimary.scale.y / primaryStart.scale.y;
+  return drag.ids.map((id) => {
+    if (id === drag.id) return { id, ...nextPrimary };
+    const start = drag.startImages[id];
+    if (!start) return { id, position: { ...drag.anchor }, scale: { x: IMAGE_MIN_SCALE, y: IMAGE_MIN_SCALE } };
+    return {
+      id,
+      scale: {
+        x: Math.max(IMAGE_MIN_SCALE, Math.abs(start.scale.x * factorX)),
+        y: Math.max(IMAGE_MIN_SCALE, Math.abs(start.scale.y * factorY))
+      },
+      position: {
+        x: drag.anchor.x + (start.position.x - drag.anchor.x) * factorX,
+        y: drag.anchor.y + (start.position.y - drag.anchor.y) * factorY
+      }
+    };
   });
 }
 
@@ -1089,8 +1181,38 @@ function hitImage(world: Vec2, images: WorkspaceImageState[]): WorkspaceImageSta
   return undefined;
 }
 
+function snapshotImagePositions(images: WorkspaceImageState[], ids: string[]): Record<string, Vec2> {
+  const idSet = new Set(ids);
+  const positions: Record<string, Vec2> = {};
+  for (const image of images) {
+    if (idSet.has(image.id)) positions[image.id] = { ...image.position };
+  }
+  return positions;
+}
+
+function snapshotImageStates(
+  images: WorkspaceImageState[],
+  ids: string[]
+): Record<string, { position: Vec2; scale: Vec2 }> {
+  const idSet = new Set(ids);
+  const states: Record<string, { position: Vec2; scale: Vec2 }> = {};
+  for (const image of images) {
+    if (idSet.has(image.id)) {
+      states[image.id] = {
+        position: { ...image.position },
+        scale: { ...image.scale }
+      };
+    }
+  }
+  return states;
+}
+
 function vertexKey(id: string, index: number): string {
   return `${id}#${index}`;
+}
+
+function uniqueIds(ids: string[]): string[] {
+  return [...new Set(ids)];
 }
 
 function vertexRefsFromKeys(keys: Set<string>): VertexRef[] {
