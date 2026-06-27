@@ -128,8 +128,6 @@ const QUAD = new Float32Array([
   -1, -1, 0, 0 // bottom-left
 ]);
 
-const READBACK_CHUNK_BYTES = 2 * 1024 * 1024;
-
 interface GpuContext {
   gl: WebGL2RenderingContext;
   program: WebGLProgram;
@@ -406,97 +404,6 @@ export function gpuExtractPerspective(
     context = null;
     if (typeof console !== "undefined") console.warn("GPU extraction failed, falling back to CPU.", error);
     return null;
-  }
-}
-
-/**
- * Non-blocking version of `gpuExtractPerspective`. Kicks off the readback into a
- * Pixel Buffer Object and polls a fence across animation frames, so the main
- * thread never stalls waiting for the GPU. Used to commit the final texture on
- * pointer-up without the release hitch. Resolves null when no source owns the
- * ripper or the GPU is unavailable.
- */
-export function gpuExtractPerspectiveAsync(
-  ripper: PolygonRipper,
-  sourceImages: PlacedImage[]
-): Promise<ExtractionResult | null> {
-  const ctx = init();
-  if (!ctx) return Promise.resolve(null);
-
-  const ownerIndex = findOwnerImageIndex(ripper, sourceImages);
-  if (ownerIndex < 0) return Promise.resolve(null);
-  const owner = sourceImages[ownerIndex];
-  if (!owner) return Promise.resolve(null);
-
-  try {
-    const { gl } = ctx;
-    const { width, height } = inferExtractionSize(ripper);
-    const byteLength = width * height * 4;
-
-    resizeOutput(ctx, width, height);
-    gl.bindFramebuffer(gl.FRAMEBUFFER, ctx.framebuffer);
-    drawWarp(ctx, ripper, owner, width, height, -1);
-
-    // Each in-flight commit gets its own PBO; readPixels(…, 0) packs into it
-    // asynchronously on the GPU and returns immediately.
-    const pbo = gl.createBuffer();
-    if (!pbo) throw new Error("Unable to create pixel pack buffer.");
-    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, pbo);
-    gl.bufferData(gl.PIXEL_PACK_BUFFER, byteLength, gl.STREAM_READ);
-    gl.readPixels(0, 0, width, height, gl.RGBA, gl.UNSIGNED_BYTE, 0);
-    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
-
-    const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
-    gl.flush();
-
-    return new Promise<ExtractionResult | null>((resolve) => {
-      const finish = (result: ExtractionResult | null) => {
-        if (sync) gl.deleteSync(sync);
-        gl.deleteBuffer(pbo);
-        resolve(result);
-      };
-      const poll = () => {
-        if (!sync) return finish(null);
-        const status = gl.clientWaitSync(sync, 0, 0);
-        if (status === gl.TIMEOUT_EXPIRED) {
-          requestAnimationFrame(poll);
-          return;
-        }
-        if (status === gl.WAIT_FAILED) return finish(null);
-        const out = new Uint8ClampedArray(byteLength);
-        let offset = 0;
-        const copyChunk = () => {
-          try {
-            const length = Math.min(READBACK_CHUNK_BYTES, byteLength - offset);
-            gl.bindBuffer(gl.PIXEL_PACK_BUFFER, pbo);
-            gl.getBufferSubData(
-              gl.PIXEL_PACK_BUFFER,
-              offset,
-              new Uint8Array(out.buffer, offset, length),
-              0,
-              length
-            );
-            gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
-            offset += length;
-            if (offset < byteLength) {
-              requestAnimationFrame(copyChunk);
-              return;
-            }
-            finish({ image: { width, height, data: out }, ownerIndex });
-          } catch {
-            gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
-            finish(null);
-          }
-        };
-        copyChunk();
-      };
-      requestAnimationFrame(poll);
-    });
-  } catch (error) {
-    initFailed = true;
-    context = null;
-    if (typeof console !== "undefined") console.warn("GPU async extraction failed.", error);
-    return Promise.resolve(null);
   }
 }
 

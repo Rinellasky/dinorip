@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef } from "react";
 import type { PointerEvent as ReactPointerEvent, ReactElement } from "react";
 import { VIEWPORT_MAX_ZOOM, VIEWPORT_MIN_ZOOM } from "@dinorip/ipc-contracts";
 import type { MenuCommand } from "@dinorip/ipc-contracts";
@@ -116,27 +116,208 @@ interface ImageContextMenu {
   y: number;
 }
 
+interface AppState extends HistorySnapshot {
+  imageMenu: ImageContextMenu | null;
+  atlasManualSize: { width: number; height: number } | null;
+  atlasSquare: boolean;
+  sourceView: ViewState;
+  atlasView: ViewState;
+  status: string;
+  showShortcuts: boolean;
+  resizingPart: LayoutResizePart | null;
+  undoStack: HistorySnapshot[];
+  redoStack: HistorySnapshot[];
+}
+
+// AppState fields are data-only. The reducer uses `typeof value === "function"`
+// to support functional updaters, so adding function-valued state would need a
+// different action shape.
+type AppStateValue<K extends keyof AppState> = AppState[K] | ((current: AppState[K]) => AppState[K]);
+
+type AppStateAction =
+  | { [K in keyof AppState]-?: { type: "set"; key: K; value: AppStateValue<K> } }[keyof AppState]
+  | { type: "resetBenchmarkWorkspace" };
+
+const initialAppState: AppState = {
+  sourceImages: [],
+  atlasImages: [],
+  rippers: [],
+  selectedSourceImageId: undefined,
+  selectedAtlasImageId: undefined,
+  selectedRipperId: undefined,
+  selectedAtlasImageIds: [],
+  selectedRipperIds: [],
+  imageMenu: null,
+  atlasManualSize: null,
+  atlasSquare: false,
+  sourceView: defaultViewState,
+  atlasView: defaultViewState,
+  status: "",
+  showShortcuts: false,
+  resizingPart: null,
+  undoStack: [],
+  redoStack: []
+};
+
+function appStateReducer(state: AppState, action: AppStateAction): AppState {
+  if (action.type === "resetBenchmarkWorkspace") {
+    return {
+      ...state,
+      sourceImages: [],
+      atlasImages: [],
+      rippers: [],
+      selectedSourceImageId: undefined,
+      selectedAtlasImageId: undefined,
+      selectedRipperId: undefined,
+      selectedAtlasImageIds: [],
+      selectedRipperIds: [],
+      undoStack: [],
+      redoStack: [],
+      imageMenu: null,
+      sourceView: defaultViewState,
+      atlasView: defaultViewState,
+      status: "Benchmark reset"
+    };
+  }
+
+  const current = state[action.key];
+  const value = action.value;
+  const next = typeof value === "function" ? (value as (currentValue: typeof current) => typeof current)(current) : value;
+  return Object.is(current, next) ? state : { ...state, [action.key]: next };
+}
+
+type ResolvedExtraction = {
+  ripper: RipperState;
+  index: number;
+  outputImageId: string;
+  outputSize: ExtractionOutputSize;
+  result: ExtractionResult;
+};
+
+type ExtractionJob = {
+  ripper: RipperState;
+  index: number;
+  outputImageId: string;
+  outputSize: ExtractionOutputSize;
+};
+
+type ExtractionOutputSize = {
+  width: number;
+  height: number;
+  pixels: number;
+};
+
+type MutableRef<T> = {
+  current: T;
+};
+
+function useLazyRef<T>(factory: () => T): MutableRef<T> {
+  const ref = useRef<T | null>(null);
+  if (ref.current === null) ref.current = factory();
+  return ref as MutableRef<T>;
+}
+
+function requestCanvasRender() {
+  window.dispatchEvent(new Event(WORKSPACE_RENDER_EVENT));
+}
+
+function toPlacedImages(sourceSnapshot: WorkspaceImageState[]): PlacedImage[] {
+  return sourceSnapshot.map((image) => ({
+    image: image.image,
+    position: image.position,
+    scale: image.scale
+  }));
+}
+
+function buildExtractionInputs(ripperSnapshot: RipperState[], sourceSnapshot: WorkspaceImageState[]) {
+  const sourceItems = toPlacedImages(sourceSnapshot);
+  const allJobs = ripperSnapshot.map((ripper, index): ExtractionJob => ({
+    ripper,
+    index,
+    outputImageId: ripper.outputImageId ?? createId("atlas"),
+    outputSize: extractionOutputSize(ripper)
+  }));
+  const jobs: ExtractionJob[] = [];
+  const skipped: ExtractionJob[] = [];
+  for (const job of allJobs) {
+    if (job.outputSize.pixels <= MAX_COMMIT_PIXEL_LIMIT) jobs.push(job);
+    else skipped.push(job);
+  }
+  return { sourceItems, jobs, skipped };
+}
+
+function extractionOutputSize(ripper: RipperState): ExtractionOutputSize {
+  const size = inferExtractionSize(ripper);
+  return {
+    width: size.width,
+    height: size.height,
+    pixels: size.width * size.height
+  };
+}
+
+function tooLargeStatus(size: Pick<ExtractionOutputSize, "width" | "height">): string {
+  return `Texture too large to finalize ${size.width} x ${size.height}`;
+}
+
+function ripperSignaturesForIds(rippers: RipperState[], ids: string[]): string {
+  const idSet = new Set(ids);
+  const signatures: string[] = [];
+  for (const ripper of rippers) {
+    if (idSet.has(ripper.id)) signatures.push(ripperSignature(ripper));
+  }
+  return signatures.join("|");
+}
+
 export function App(): ReactElement {
-  const [sourceImages, setSourceImages] = useState<WorkspaceImageState[]>([]);
-  const [atlasImages, setAtlasImages] = useState<WorkspaceImageState[]>([]);
-  const [rippers, setRippers] = useState<RipperState[]>([]);
-  const [selectedSourceImageId, setSelectedSourceImageId] = useState<string | undefined>();
-  const [selectedAtlasImageId, setSelectedAtlasImageId] = useState<string | undefined>();
-  const [selectedRipperId, setSelectedRipperId] = useState<string | undefined>();
-  const [selectedAtlasImageIds, setSelectedAtlasImageIds] = useState<string[]>([]);
-  const [selectedRipperIds, setSelectedRipperIds] = useState<string[]>([]);
+  return useApp();
+}
+
+function useApp(): ReactElement {
+  const [appState, dispatchAppState] = useReducer(appStateReducer, initialAppState);
+  const {
+    sourceImages,
+    atlasImages,
+    rippers,
+    selectedSourceImageId,
+    selectedAtlasImageId,
+    selectedRipperId,
+    selectedAtlasImageIds,
+    selectedRipperIds,
+    imageMenu,
+    atlasManualSize,
+    atlasSquare,
+    sourceView,
+    atlasView,
+    status,
+    showShortcuts,
+    resizingPart,
+    undoStack,
+    redoStack
+  } = appState;
+  const setAppState = <K extends keyof AppState>(key: K, value: AppStateValue<K>) => {
+    dispatchAppState({ type: "set", key, value } as AppStateAction);
+  };
+  // Setter wrappers intentionally close only over reducer dispatch. Keep them
+  // state-free so callbacks that capture them behave like useState setters.
+  const setSourceImages = (value: AppStateValue<"sourceImages">) => setAppState("sourceImages", value);
+  const setAtlasImages = (value: AppStateValue<"atlasImages">) => setAppState("atlasImages", value);
+  const setRippers = (value: AppStateValue<"rippers">) => setAppState("rippers", value);
+  const setSelectedSourceImageId = (value: AppStateValue<"selectedSourceImageId">) => setAppState("selectedSourceImageId", value);
+  const setSelectedAtlasImageId = (value: AppStateValue<"selectedAtlasImageId">) => setAppState("selectedAtlasImageId", value);
+  const setSelectedRipperId = (value: AppStateValue<"selectedRipperId">) => setAppState("selectedRipperId", value);
+  const setSelectedAtlasImageIds = (value: AppStateValue<"selectedAtlasImageIds">) => setAppState("selectedAtlasImageIds", value);
+  const setSelectedRipperIds = (value: AppStateValue<"selectedRipperIds">) => setAppState("selectedRipperIds", value);
+  const setImageMenu = (value: AppStateValue<"imageMenu">) => setAppState("imageMenu", value);
+  const setAtlasManualSize = (value: AppStateValue<"atlasManualSize">) => setAppState("atlasManualSize", value);
+  const setAtlasSquare = (value: AppStateValue<"atlasSquare">) => setAppState("atlasSquare", value);
+  const setSourceView = (value: AppStateValue<"sourceView">) => setAppState("sourceView", value);
+  const setAtlasView = (value: AppStateValue<"atlasView">) => setAppState("atlasView", value);
+  const setStatus = (value: AppStateValue<"status">) => setAppState("status", value);
+  const setShowShortcuts = (value: AppStateValue<"showShortcuts">) => setAppState("showShortcuts", value);
+  const setResizingPart = (value: AppStateValue<"resizingPart">) => setAppState("resizingPart", value);
+  const setUndoStack = (value: AppStateValue<"undoStack">) => setAppState("undoStack", value);
+  const setRedoStack = (value: AppStateValue<"redoStack">) => setAppState("redoStack", value);
   const currentProjectPathRef = useRef<string | undefined>(undefined);
-  // Right-click image menu. Atlas textures may also expose curve conserve/rectify.
-  const [imageMenu, setImageMenu] = useState<ImageContextMenu | null>(null);
-  // Atlas export sizing: a manual minimum size (null = auto-fit to content) and
-  // whether the export region is padded to a square.
-  const [atlasManualSize, setAtlasManualSize] = useState<{ width: number; height: number } | null>(null);
-  const [atlasSquare, setAtlasSquare] = useState(false);
-  const [sourceView, setSourceView] = useState<ViewState>(defaultViewState);
-  const [atlasView, setAtlasView] = useState<ViewState>(defaultViewState);
-  const [status, setStatus] = useState("");
-  const [showShortcuts, setShowShortcuts] = useState(false);
-  const [resizingPart, setResizingPart] = useState<LayoutResizePart | null>(null);
   const tilesRef = useRef<HTMLDivElement | null>(null);
   const workerRef = useRef<Worker | null>(null);
   const resizeFrame = useRef(0);
@@ -146,7 +327,8 @@ export function App(): ReactElement {
     end(event: PointerEvent): void;
   } | null>(null);
   const autoExtractRun = useRef(0);
-  const pendingJobs = useRef(new Map<string, { resolve: (value: any) => void; reject: (reason: Error) => void }>());
+  const pendingJobs = useLazyRef(() => new Map<string, { resolve: (value: any) => void; reject: (reason: Error) => void }>());
+  const pendingJobsMap = pendingJobs.current;
   // Live GPU projection shown in place of the atlas image while a ripper is
   // dragged. Mutated through setLivePreview(), which explicitly redraws canvases.
   const livePreviewRef = useRef<WorkspaceLivePreview | null>(null);
@@ -162,13 +344,7 @@ export function App(): ReactElement {
   // `interactionSnapshot` holds the pre-drag state for a single pointer
   // interaction so a drag becomes one undo step (and a click that moves nothing
   // records none).
-  const [undoStack, setUndoStack] = useState<HistorySnapshot[]>([]);
-  const [redoStack, setRedoStack] = useState<HistorySnapshot[]>([]);
   const interactionSnapshot = useRef<HistorySnapshot | null>(null);
-
-  function requestCanvasRender() {
-    window.dispatchEvent(new Event(WORKSPACE_RENDER_EVENT));
-  }
 
   function updateCurrentProjectPath(path: string | undefined) {
     currentProjectPathRef.current = path;
@@ -266,9 +442,9 @@ export function App(): ReactElement {
     const worker = new Worker(new URL("./workers/processing.worker.ts", import.meta.url), { type: "module" });
     worker.onmessage = (event: MessageEvent<WorkerResponse<unknown>>) => {
       const response = event.data;
-      const pending = pendingJobs.current.get(response.id);
+      const pending = pendingJobsMap.get(response.id);
       if (!pending) return;
-      pendingJobs.current.delete(response.id);
+      pendingJobsMap.delete(response.id);
       if (response.ok) pending.resolve(response.result);
       else pending.reject(new Error(response.error));
     };
@@ -277,7 +453,7 @@ export function App(): ReactElement {
       worker.terminate();
       workerRef.current = null;
     };
-  }, []);
+  }, [pendingJobsMap]);
 
   useEffect(() => {
     if (!import.meta.env.DEV) return;
@@ -295,21 +471,8 @@ export function App(): ReactElement {
         editingRipperIdsRef.current = [];
         editStartSignatureRef.current = null;
         interactionSnapshot.current = null;
-        setSourceImages([]);
-        setAtlasImages([]);
-        setRippers([]);
-        setSelectedSourceImageId(undefined);
-        setSelectedAtlasImageId(undefined);
-        setSelectedRipperId(undefined);
-        setSelectedAtlasImageIds([]);
-        setSelectedRipperIds([]);
-        setUndoStack([]);
-        setRedoStack([]);
-        setImageMenu(null);
         updateCurrentProjectPath(undefined);
-        setSourceView(defaultViewState);
-        setAtlasView(defaultViewState);
-        setStatus("Benchmark reset");
+        dispatchAppState({ type: "resetBenchmarkWorkspace" });
       }
     };
     window.__dinoripDev = api;
@@ -518,9 +681,33 @@ export function App(): ReactElement {
   const atlasSizeHeight = atlasRegion?.height ?? atlasManualSize?.height ?? 256;
   const sourceExtractionKey = useMemo(() => sourceImages.map(sourceImageSignature).join("|"), [sourceImages]);
   const ripperExtractionKey = useMemo(() => rippers.map(ripperSignature).join("|"), [rippers]);
+  const extractionSnapshotRef = useLazyRef(() => ({
+    sourceExtractionKey,
+    ripperExtractionKey,
+    sourceImages,
+    rippers
+  }));
+  if (
+    extractionSnapshotRef.current.sourceExtractionKey !== sourceExtractionKey ||
+    extractionSnapshotRef.current.ripperExtractionKey !== ripperExtractionKey
+  ) {
+    extractionSnapshotRef.current = { sourceExtractionKey, ripperExtractionKey, sourceImages, rippers };
+  }
+  const selectedRipperIdRef = useRef<string | undefined>(selectedRipperId);
+  selectedRipperIdRef.current = selectedRipperId;
+  const extractionSnapshot = extractionSnapshotRef.current;
+  const autoExtractorsRef = useRef({ autoExtractGpu, autoExtractRippers });
+  autoExtractorsRef.current.autoExtractGpu = autoExtractGpu;
+  autoExtractorsRef.current.autoExtractRippers = autoExtractRippers;
+  const autoExtractors = autoExtractorsRef.current;
 
   useEffect(() => {
-    if (sourceImages.length === 0 || rippers.length === 0) return;
+    const {
+      sourceImages: sourceSnapshot,
+      rippers: ripperSnapshot
+    } = extractionSnapshot;
+    if (sourceSnapshot.length === 0 || ripperSnapshot.length === 0) return;
+    const selectedRipperSnapshot = selectedRipperIdRef.current;
     const runId = autoExtractRun.current + 1;
     autoExtractRun.current = runId;
     // The GPU path is fast enough to project live, so coalesce a burst of
@@ -533,7 +720,7 @@ export function App(): ReactElement {
           return;
         }
         const editingId = editingRipperIdRef.current;
-        const editingRipper = editingId ? rippers.find((item) => item.id === editingId) : undefined;
+        const editingRipper = editingId ? ripperSnapshot.find((item) => item.id === editingId) : undefined;
         // While dragging an already-extracted ripper, project only the grabbed
         // ripper live. Multi-selected rippers still finalize together on release
         // without paying live-preview cost for every selected item per frame.
@@ -541,7 +728,7 @@ export function App(): ReactElement {
           const previewSize = inferExtractionSize(editingRipper);
           const canRenderLivePreview = previewSize.width * previewSize.height <= LIVE_PREVIEW_PIXEL_LIMIT;
           const preview = canRenderLivePreview
-            ? gpuRenderLivePreview(editingRipper, toPlacedImages(sourceImages), LIVE_PREVIEW_MAX_RENDER_SIZE)
+              ? gpuRenderLivePreview(editingRipper, toPlacedImages(sourceSnapshot), LIVE_PREVIEW_MAX_RENDER_SIZE)
             : null;
           if (preview) {
             setLivePreview({ imageId: editingRipper.outputImageId, ...preview });
@@ -556,45 +743,34 @@ export function App(): ReactElement {
         }
         // Otherwise bake into state (creates the atlas image, refines to full
         // resolution, and feeds the export/seamless pipeline).
-        autoExtractGpu(runId, rippers, sourceImages, selectedRipperId);
+        autoExtractors.autoExtractGpu(runId, ripperSnapshot, sourceSnapshot, selectedRipperSnapshot);
       });
       return () => window.cancelAnimationFrame(frame);
     }
     const timeout = window.setTimeout(() => {
-      void autoExtractRippers(runId, rippers, sourceImages, selectedRipperId);
+      autoExtractors.autoExtractRippers(runId, ripperSnapshot, sourceSnapshot, selectedRipperSnapshot);
     }, AUTO_EXTRACT_DELAY_MS);
     return () => window.clearTimeout(timeout);
     // Deliberately not keyed on `selectedRipperId`: only geometry/source changes
     // need a re-extraction. Selecting a ripper must not re-project every ripper
     // (that re-rasterizes the atlas and is what made clicking a ripper lag).
-  }, [ripperExtractionKey, sourceExtractionKey]);
-
-  // Selecting a ripper highlights its extracted texture in the atlas. This is a
-  // cheap selection follow that replaces the side effect the extraction pass
-  // used to do, so it no longer needs to re-extract just to track selection.
-  useEffect(() => {
-    if (!selectedRipperId) return;
-    const ripper = rippers.find((item) => item.id === selectedRipperId);
-    if (ripper?.outputImageId) setSelectedAtlasImageId(ripper.outputImageId);
-    // Keyed only on selection change; `rippers` is read fresh from the
-    // triggering render, and the extraction pass handles post-extract selection.
-  }, [selectedRipperId]);
+  }, [autoExtractors, extractionSnapshot, ripperExtractionKey, sourceExtractionKey]);
 
   useEffect(() => () => {
     if (resizeFrame.current !== 0) window.cancelAnimationFrame(resizeFrame.current);
     removeResizeListeners();
   }, []);
 
-  async function runWorker<T>(message: Omit<Record<string, unknown>, "id">): Promise<T> {
+  const runWorker = useCallback(<T,>(message: Omit<Record<string, unknown>, "id">): Promise<T> => {
     const worker = workerRef.current;
     if (!worker) throw new Error("Processing worker is not ready.");
     const id = createId("job");
     const promise = new Promise<T>((resolve, reject) => {
-      pendingJobs.current.set(id, { resolve, reject });
+      pendingJobsMap.set(id, { resolve, reject });
     });
     worker.postMessage({ id, ...message });
     return promise;
-  }
+  }, [pendingJobsMap]);
 
   function removeResizeListeners() {
     const listeners = resizeListeners.current;
@@ -817,11 +993,12 @@ export function App(): ReactElement {
     commitHistory();
     clearLivePreviews();
     setImageMenu(null);
-    const outputIds = new Set(rippers
-      .filter((item) => ids.includes(item.id))
-      .map((item) => item.outputImageId)
-      .filter((id): id is string => Boolean(id)));
-    setRippers((current) => current.filter((item) => !ids.includes(item.id)));
+    const idSet = new Set(ids);
+    const outputIds = new Set<string>();
+    for (const item of rippers) {
+      if (idSet.has(item.id) && item.outputImageId) outputIds.add(item.outputImageId);
+    }
+    setRippers((current) => current.filter((item) => !idSet.has(item.id)));
     if (outputIds.size > 0) setAtlasImages((current) => current.filter((item) => !outputIds.has(item.id)));
     setSelectedRipperId(undefined);
     setSelectedRipperIds([]);
@@ -879,61 +1056,6 @@ export function App(): ReactElement {
     setStatus(`Extracted ${result.image.width} x ${result.image.height}`);
   }
 
-  type ResolvedExtraction = {
-    ripper: RipperState;
-    index: number;
-    outputImageId: string;
-    outputSize: ExtractionOutputSize;
-    result: ExtractionResult;
-  };
-
-  type ExtractionJob = {
-    ripper: RipperState;
-    index: number;
-    outputImageId: string;
-    outputSize: ExtractionOutputSize;
-  };
-
-  type ExtractionOutputSize = {
-    width: number;
-    height: number;
-    pixels: number;
-  };
-
-  function toPlacedImages(sourceSnapshot: WorkspaceImageState[]): PlacedImage[] {
-    return sourceSnapshot.map((image) => ({
-      image: image.image,
-      position: image.position,
-      scale: image.scale
-    }));
-  }
-
-  function buildExtractionInputs(ripperSnapshot: RipperState[], sourceSnapshot: WorkspaceImageState[]) {
-    const sourceItems = toPlacedImages(sourceSnapshot);
-    const allJobs = ripperSnapshot.map((ripper, index): ExtractionJob => ({
-      ripper,
-      index,
-      outputImageId: ripper.outputImageId ?? createId("atlas"),
-      outputSize: extractionOutputSize(ripper)
-    }));
-    const jobs = allJobs.filter((job) => job.outputSize.pixels <= MAX_COMMIT_PIXEL_LIMIT);
-    const skipped = allJobs.filter((job) => job.outputSize.pixels > MAX_COMMIT_PIXEL_LIMIT);
-    return { sourceItems, jobs, skipped };
-  }
-
-  function extractionOutputSize(ripper: RipperState): ExtractionOutputSize {
-    const size = inferExtractionSize(ripper);
-    return {
-      width: size.width,
-      height: size.height,
-      pixels: size.width * size.height
-    };
-  }
-
-  function tooLargeStatus(size: Pick<ExtractionOutputSize, "width" | "height">): string {
-    return `Texture too large to finalize ${size.width} x ${size.height}`;
-  }
-
   function reportOversizedExtractions(skipped: ExtractionJob[], selectedRipperSnapshot?: string) {
     if (skipped.length === 0) return;
     const selected = selectedRipperSnapshot
@@ -951,9 +1073,11 @@ export function App(): ReactElement {
 
     setAtlasImages((current) => {
       const next = [...current];
+      const indexById = new Map(next.map((image, index) => [image.id, index]));
       let appended = 0;
       for (const item of extracted) {
-        const existingIndex = next.findIndex((image) => image.id === item.outputImageId);
+        const extractedImage = item.result.image;
+        const existingIndex = indexById.get(item.outputImageId) ?? -1;
         if (existingIndex >= 0) {
           const existing = next[existingIndex]!;
           // The freshly extracted image is owned and never mutated in place, so
@@ -961,18 +1085,20 @@ export function App(): ReactElement {
           // per committed texture).
           next[existingIndex] = {
             ...existing,
-            image: item.result.image,
-            originalImage: item.result.image,
+            image: extractedImage,
+            originalImage: extractedImage,
             version: existing.version + 1
           };
         } else {
+          const index = next.length;
           next.push(makeWorkspaceImage(
             `texture_${item.index}`,
-            item.result.image,
+            extractedImage,
             atlasDropPosition(current.length + appended),
             true,
             item.outputImageId
           ));
+          indexById.set(item.outputImageId, index);
           appended += 1;
         }
       }
@@ -1034,7 +1160,7 @@ export function App(): ReactElement {
     reportOversizedExtractions(skipped, selectedRipperSnapshot);
   }
 
-  async function autoExtractRippers(
+  function autoExtractRippers(
     runId: number,
     ripperSnapshot: RipperState[],
     sourceSnapshot: WorkspaceImageState[],
@@ -1045,22 +1171,24 @@ export function App(): ReactElement {
       reportOversizedExtractions(skipped, selectedRipperSnapshot);
       return;
     }
-    const settled = await Promise.allSettled(jobs.map(async (job) => ({
+    if (autoExtractRun.current !== runId) return;
+    void Promise.allSettled(jobs.map(async (job) => ({
       ...job,
       result: await runWorker<ExtractionResult | null>({
         type: "extract",
         ripper: job.ripper,
-        images: sourceItems
-      })
-    })));
-    if (autoExtractRun.current !== runId) return;
+          images: sourceItems
+        })
+    }))).then((settled) => {
+      if (autoExtractRun.current !== runId) return;
 
-    const extracted = settled
-      .filter((item): item is PromiseFulfilledResult<typeof jobs[number] & { result: ExtractionResult | null }> => item.status === "fulfilled")
-      .map((item) => item.value)
-      .filter((item): item is ResolvedExtraction => item.result !== null);
-    applyExtraction(extracted);
-    reportOversizedExtractions(skipped, selectedRipperSnapshot);
+      const extracted = settled
+        .filter((item): item is PromiseFulfilledResult<typeof jobs[number] & { result: ExtractionResult | null }> => item.status === "fulfilled")
+        .map((item) => item.value)
+        .filter((item): item is ResolvedExtraction => item.result !== null);
+      applyExtraction(extracted);
+      reportOversizedExtractions(skipped, selectedRipperSnapshot);
+    });
   }
 
   // Bake the current adjustments into the selected texture (from its untouched
@@ -1107,8 +1235,9 @@ export function App(): ReactElement {
   const computeAdjusted = useCallback(
     (image: PixelImage, settings: TextureSettings) =>
       runWorker<PixelImage>({ type: "adjust", image, settings }),
-    []
+    [runWorker]
   );
+  const closeShortcuts = useCallback(() => setShowShortcuts(false), []);
 
   async function exportSelected() {
     const images = selectedAtlasImageIds.length > 1
@@ -1356,24 +1485,26 @@ export function App(): ReactElement {
   }
 
   function selectRipper(id?: string) {
+    const outputImageId = id ? rippers.find((ripper) => ripper.id === id)?.outputImageId : undefined;
     setSelectedRipperId(id);
     setSelectedRipperIds(id ? [id] : []);
     if (id) {
       setSelectedSourceImageId(undefined);
-      setSelectedAtlasImageId(undefined);
-      setSelectedAtlasImageIds([]);
+      setSelectedAtlasImageId(outputImageId);
+      setSelectedAtlasImageIds(outputImageId ? [outputImageId] : []);
     }
     setImageMenu(null);
   }
 
   function selectRippers(ids: string[]) {
     const next = ids.filter((id) => rippers.some((ripper) => ripper.id === id));
+    const outputImageId = next[0] ? rippers.find((ripper) => ripper.id === next[0])?.outputImageId : undefined;
     setSelectedRipperIds(next);
     setSelectedRipperId(next[0]);
     if (next.length > 0) {
       setSelectedSourceImageId(undefined);
-      setSelectedAtlasImageId(undefined);
-      setSelectedAtlasImageIds([]);
+      setSelectedAtlasImageId(outputImageId);
+      setSelectedAtlasImageIds(outputImageId ? [outputImageId] : []);
     }
     setImageMenu(null);
   }
@@ -1393,12 +1524,13 @@ export function App(): ReactElement {
     }
 
     const ids = rippers.map((ripper) => ripper.id);
+    const outputImageId = ids[0] ? rippers.find((ripper) => ripper.id === ids[0])?.outputImageId : undefined;
     setSelectedRipperIds(ids);
     setSelectedRipperId(ids[0]);
     if (ids.length > 0) {
       setSelectedSourceImageId(undefined);
-      setSelectedAtlasImageId(undefined);
-      setSelectedAtlasImageIds([]);
+      setSelectedAtlasImageId(outputImageId);
+      setSelectedAtlasImageIds(outputImageId ? [outputImageId] : []);
     }
     setStatus(ids.length === 0 ? "No rippers to select" : `Selected ${ids.length} ripper${ids.length === 1 ? "" : "s"}`);
   }
@@ -1430,10 +1562,7 @@ export function App(): ReactElement {
       ? editedIdsOverride
       : selectedRipperIds.length > 1 && selectedRipperIds.includes(id) ? selectedRipperIds : [id];
     editingRipperIdsRef.current = editedIds;
-    editStartSignatureRef.current = rippers
-      .filter((item) => editedIds.includes(item.id))
-      .map(ripperSignature)
-      .join("|");
+    editStartSignatureRef.current = ripperSignaturesForIds(rippers, editedIds);
     // Show the last committed pixels until the first live frame is rendered.
     clearLivePreviews();
   }
@@ -1453,10 +1582,7 @@ export function App(): ReactElement {
     // when clicking a ripper over a large image. Skip the commit when the
     // ripper is unchanged; the live preview was never shown, so the committed
     // pixels are already on screen.
-    const endSignature = rippers
-      .filter((item) => editedIds.includes(item.id))
-      .map(ripperSignature)
-      .join("|");
+    const endSignature = ripperSignaturesForIds(rippers, editedIds);
     const unchanged = startSignature != null && endSignature === startSignature;
     if (unchanged) {
       clearLivePreviews();
@@ -1724,7 +1850,7 @@ export function App(): ReactElement {
           </>
         );
       })()}
-      {showShortcuts && <ShortcutsOverlay onClose={() => setShowShortcuts(false)} />}
+      {showShortcuts && <ShortcutsOverlay onClose={closeShortcuts} />}
     </main>
   );
 }
@@ -1843,10 +1969,12 @@ function layoutAppendedImages(
 function imageFilesFromClipboard(data: DataTransfer | null): File[] {
   if (!data) return [];
 
-  const itemFiles = Array.from(data.items)
-    .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
-    .map((item) => item.getAsFile())
-    .filter((file): file is File => Boolean(file));
+  const itemFiles: File[] = [];
+  for (const item of data.items) {
+    if (item.kind !== "file" || !item.type.startsWith("image/")) continue;
+    const file = item.getAsFile();
+    if (file) itemFiles.push(file);
+  }
   if (itemFiles.length > 0) return itemFiles;
 
   return Array.from(data.files).filter((file) => file.type.startsWith("image/"));

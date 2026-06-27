@@ -93,13 +93,8 @@ export function registerIpc(getWindow: () => BrowserWindow | null): void {
 
     const folder = result.filePaths[0];
     await fs.mkdir(folder, { recursive: true });
-    const paths: string[] = [];
-
-    for (let index = 0; index < request.images.length; index += 1) {
-      const filePath = path.join(folder, `texture_${index}.png`);
-      await encodePngToFile(request.images[index]!, filePath);
-      paths.push(filePath);
-    }
+    const paths = request.images.map((_image, index) => path.join(folder, `texture_${index}.png`));
+    await Promise.all(request.images.map((image, index) => encodePngToFile(image, paths[index]!)));
 
     return { canceled: false, paths };
   });

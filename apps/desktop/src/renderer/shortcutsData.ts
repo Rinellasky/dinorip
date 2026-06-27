@@ -2,7 +2,6 @@
 // in-app Shortcuts overlay and the README generator
 // (scripts/generate-readme-shortcuts.mjs). Edit shortcuts.data.json — never the
 // README's Shortcuts section by hand; it is regenerated from that file.
-import { MOD_KEY } from "./shortcuts";
 import shortcutsData from "./shortcuts.data.json";
 
 // A key combo is a list of tokens chained with "+". The literal "mod" token is
@@ -37,14 +36,6 @@ export interface ShortcutsDoc {
 }
 
 export const SHORTCUTS = shortcutsData as ShortcutsDoc;
-
-// The token used in the data to stand in for the platform modifier key.
-const MOD_TOKEN = "mod";
-
-/** Resolve a single key token to its on-screen label (⌘ / Ctrl for "mod"). */
-export function renderKeyToken(token: string): string {
-  return token === MOD_TOKEN ? MOD_KEY : token;
-}
 
 // Eagerly bundle whatever demo GIFs exist under assets/shortcuts/ as URLs. The
 // folder may be empty (clips are recorded later); a missing GIF simply has no

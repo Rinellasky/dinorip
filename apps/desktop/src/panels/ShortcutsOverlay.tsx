@@ -1,9 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import type { PointerEvent as ReactPointerEvent, ReactElement } from "react";
 import { X } from "lucide-react";
-import { SHORTCUTS, gifUrl, renderKeyToken } from "../renderer/shortcutsData";
+import { SHORTCUTS, gifUrl } from "../renderer/shortcutsData";
 import type { ShortcutEntry } from "../renderer/shortcutsData";
+import { MOD_KEY } from "../renderer/shortcuts";
 import { ShaderPreview } from "../preview/ShaderPreview";
 
 interface ShortcutsOverlayProps {
@@ -26,18 +27,23 @@ const CURSOR_GAP = 16;
 // A single panel listing every shortcut. Hovering a shortcut that has a demo
 // floats its clip (or the shader placeholder until recorded) beside the cursor.
 export function ShortcutsOverlay(props: ShortcutsOverlayProps): ReactElement {
+  const dialogRef = useRef<HTMLDialogElement | null>(null);
   const [hover, setHover] = useState<HoverState | null>(null);
 
   useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    const onCancel = (event: Event) => {
       event.preventDefault();
-      event.stopPropagation();
       props.onClose();
     };
-    window.addEventListener("keydown", onKeyDown, true);
-    return () => window.removeEventListener("keydown", onKeyDown, true);
-  }, [props]);
+    dialog.addEventListener("cancel", onCancel);
+    if (!dialog.open) dialog.showModal();
+    return () => {
+      dialog.removeEventListener("cancel", onCancel);
+      if (dialog.open) dialog.close();
+    };
+  }, [props.onClose]);
 
   const trackHover = (shortcut: ShortcutEntry, event: ReactPointerEvent) => {
     if (!shortcut.gif) {
@@ -47,9 +53,12 @@ export function ShortcutsOverlay(props: ShortcutsOverlayProps): ReactElement {
     setHover({ shortcut, x: event.clientX, y: event.clientY });
   };
 
+  const closeFromBackdrop = (event: ReactPointerEvent<HTMLDialogElement>) => {
+    if (event.target === event.currentTarget) props.onClose();
+  };
+
   return createPortal(
-    <div className="shortcuts-overlay" role="dialog" aria-modal="true" aria-label="Shortcuts">
-      <div className="shortcuts-overlay__backdrop" onPointerDown={props.onClose} />
+    <dialog ref={dialogRef} className="shortcuts-overlay" aria-label="Shortcuts" onPointerDown={closeFromBackdrop}>
       <div className="shortcuts-modal">
         <header className="shortcuts-modal__header">
           <h2>Shortcuts</h2>
@@ -81,7 +90,7 @@ export function ShortcutsOverlay(props: ShortcutsOverlayProps): ReactElement {
         </div>
       </div>
       {hover && <FloatingDemo hover={hover} />}
-    </div>,
+    </dialog>,
     document.body
   );
 }
@@ -96,13 +105,17 @@ function KeyCombos(props: { shortcut: ShortcutEntry }): ReactElement {
           {combo.map((token, tokenIndex) => (
             <span key={tokenIndex} className="shortcuts-combo">
               {tokenIndex > 0 && <span className="shortcuts-sep">+</span>}
-              <kbd>{renderKeyToken(token)}</kbd>
+              <KeyToken token={token} />
             </span>
           ))}
         </span>
       ))}
     </span>
   );
+}
+
+function KeyToken(props: { token: string }): ReactElement {
+  return <kbd>{props.token === "mod" ? MOD_KEY : props.token}</kbd>;
 }
 
 // The clip that floats beside the cursor: the recorded GIF, or the wavy shader

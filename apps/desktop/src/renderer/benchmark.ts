@@ -242,24 +242,31 @@ function startLagMonitor() {
 async function makeTestImage(width: number, height: number): Promise<PixelImage> {
   const data = new Uint8ClampedArray(width * height * 4);
   const rowsPerChunk = Math.max(1, Math.floor(1_250_000 / (width * 4)));
-  for (let y = 0; y < height; y += 1) {
-    let offset = y * width * 4;
-    for (let x = 0; x < width; x += 1) {
-      const tile = ((Math.floor(x / 128) + Math.floor(y / 128)) % 2) * 38;
-      const stripe = Math.abs((x - y) % 256) < 8 ? 255 : 0;
-      const r = Math.max(stripe, Math.floor((x / width) * 220) + tile);
-      const g = Math.max(stripe, Math.floor((y / height) * 220) + tile);
-      const b = Math.max(stripe, Math.floor(((x / width + y / height) / 2) * 220) + tile);
-      data[offset] = r;
-      data[offset + 1] = g;
-      data[offset + 2] = b;
-      data[offset + 3] = 255;
-      offset += 4;
-    }
-    if (y > 0 && y % rowsPerChunk === 0) await yieldToTask();
-  }
+  let y = 0;
 
-  return { width, height, data };
+  return new Promise((resolve) => {
+    const fillChunk = () => {
+      const endY = Math.min(height, y + rowsPerChunk);
+      for (; y < endY; y += 1) {
+        let offset = y * width * 4;
+        for (let x = 0; x < width; x += 1) {
+          const tile = ((Math.floor(x / 128) + Math.floor(y / 128)) % 2) * 38;
+          const stripe = Math.abs((x - y) % 256) < 8 ? 255 : 0;
+          const r = Math.max(stripe, Math.floor((x / width) * 220) + tile);
+          const g = Math.max(stripe, Math.floor((y / height) * 220) + tile);
+          const b = Math.max(stripe, Math.floor(((x / width + y / height) / 2) * 220) + tile);
+          data[offset] = r;
+          data[offset + 1] = g;
+          data[offset + 2] = b;
+          data[offset + 3] = 255;
+          offset += 4;
+        }
+      }
+      if (y < height) void yieldToTask().then(fillChunk);
+      else resolve({ width, height, data });
+    };
+    fillChunk();
+  });
 }
 
 function yieldToTask(): Promise<void> {
@@ -316,18 +323,34 @@ function statusText(): string {
 
 async function waitFor(predicate: () => boolean, timeoutMs: number): Promise<void> {
   const start = performance.now();
-  while (performance.now() - start < timeoutMs) {
-    if (predicate()) return;
-    await nextFrame();
-  }
-  throw new Error("Timed out waiting for benchmark condition.");
+  return new Promise((resolve, reject) => {
+    const tick = () => {
+      if (predicate()) {
+        resolve();
+        return;
+      }
+      if (performance.now() - start >= timeoutMs) {
+        reject(new Error("Timed out waiting for benchmark condition."));
+        return;
+      }
+      void nextFrame().then(tick);
+    };
+    tick();
+  });
 }
 
 async function wait(ms: number): Promise<void> {
   const end = performance.now() + ms;
-  do {
-    await nextFrame();
-  } while (performance.now() < end);
+  return new Promise((resolve) => {
+    const tick = () => {
+      if (performance.now() >= end) {
+        resolve();
+        return;
+      }
+      void nextFrame().then(tick);
+    };
+    tick();
+  });
 }
 
 function nextFrame(): Promise<void> {

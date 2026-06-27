@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 import type { ReactElement } from "react";
 import {
   IMAGE_MIN_SCALE,
@@ -159,30 +159,41 @@ type CachedDisplaySource = {
   loading: boolean;
 };
 
+type MutableRef<T> = {
+  current: T;
+};
+
+function useLazyRef<T>(factory: () => T): MutableRef<T> {
+  const ref = useRef<T | null>(null);
+  if (ref.current === null) ref.current = factory();
+  return ref as MutableRef<T>;
+}
+
 export function CanvasWorkspace(props: CanvasWorkspaceProps): ReactElement {
+  return useCanvasWorkspace(props);
+}
+
+function useCanvasWorkspace(props: CanvasWorkspaceProps): ReactElement {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const dragRef = useRef<DragState>({ type: "none" });
-  const canvasCache = useRef(new Map<string, CachedDisplaySource>());
+  const canvasCache = useLazyRef(() => new Map<string, CachedDisplaySource>());
+  const canvasCacheMap = canvasCache.current;
   const renderNowRef = useRef<(time?: number) => void>(() => {});
   const rippers = props.rippers ?? [];
   // Multi-corner selection (keys are `${ripperId}#${index}`). Highlighted on the
   // canvas; dragging any member moves the whole set. Live marquee box is held in
   // a ref so dragging it does not re-render every frame.
-  const [selectedVertices, setSelectedVertices] = useState<Set<string>>(() => new Set());
+  const selectedVerticesRef = useLazyRef(() => new Set<string>());
   const marqueeRef = useRef<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
 
-  const selectedImage = useMemo(
-    () => props.images.find((image) => image.id === props.selectedImageId),
-    [props.images, props.selectedImageId]
-  );
-  const selectedImageIds = useMemo(
-    () => props.selectedImageIds ?? (props.selectedImageId ? [props.selectedImageId] : []),
-    [props.selectedImageId, props.selectedImageIds]
-  );
-  const selectedRipperIds = useMemo(
-    () => props.selectedRipperIds ?? (props.selectedRipperId ? [props.selectedRipperId] : []),
-    [props.selectedRipperId, props.selectedRipperIds]
-  );
+  const selectedImage = props.images.find((image) => image.id === props.selectedImageId);
+  const selectedImageIds = props.selectedImageIds ?? (props.selectedImageId ? [props.selectedImageId] : []);
+  const selectedRipperIds = props.selectedRipperIds ?? (props.selectedRipperId ? [props.selectedRipperId] : []);
+
+  const setSelectedVertices = (next: Set<string> | ((prev: Set<string>) => Set<string>)) => {
+    selectedVerticesRef.current = typeof next === "function" ? next(selectedVerticesRef.current) : next;
+    renderNowRef.current();
+  };
 
   const renderNow = (time = performance.now()) => {
     const canvas = canvasRef.current;
@@ -194,9 +205,9 @@ export function CanvasWorkspace(props: CanvasWorkspaceProps): ReactElement {
       ctx,
       canvas,
       props,
-      canvasCache.current,
+      canvasCacheMap,
       time,
-      selectedVertices,
+      selectedVerticesRef.current,
       marqueeRef.current,
       () => renderNowRef.current()
     );
@@ -204,8 +215,8 @@ export function CanvasWorkspace(props: CanvasWorkspaceProps): ReactElement {
   renderNowRef.current = renderNow;
 
   useEffect(() => {
-    renderNow();
-  }, [props, rippers, selectedImage, selectedVertices]);
+    renderNowRef.current();
+  }, [props]);
 
   useEffect(() => {
     if (props.kind !== "source" || rippers.length === 0) return;
@@ -221,7 +232,8 @@ export function CanvasWorkspace(props: CanvasWorkspaceProps): ReactElement {
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const observer = new ResizeObserver(() => renderNow());
+    renderNowRef.current();
+    const observer = new ResizeObserver(() => renderNowRef.current());
     observer.observe(canvas);
     return () => observer.disconnect();
   }, []);
@@ -234,17 +246,17 @@ export function CanvasWorkspace(props: CanvasWorkspaceProps): ReactElement {
 
   useEffect(() => {
     const liveIds = new Set(props.images.map((image) => image.id));
-    for (const [id, cached] of canvasCache.current) {
+    for (const [id, cached] of canvasCacheMap) {
       if (liveIds.has(id)) continue;
       disposePixelImageSource(cached.source);
-      canvasCache.current.delete(id);
+      canvasCacheMap.delete(id);
     }
-  }, [props.images]);
+  }, [canvasCacheMap, props.images]);
 
   useEffect(() => () => {
-    for (const cached of canvasCache.current.values()) disposePixelImageSource(cached.source);
-    canvasCache.current.clear();
-  }, []);
+    for (const cached of canvasCacheMap.values()) disposePixelImageSource(cached.source);
+    canvasCacheMap.clear();
+  }, [canvasCacheMap]);
 
   const toWorld = (event: React.MouseEvent<HTMLCanvasElement> | React.WheelEvent<HTMLCanvasElement>): Vec2 => {
     const canvas = canvasRef.current!;
@@ -317,6 +329,7 @@ export function CanvasWorkspace(props: CanvasWorkspaceProps): ReactElement {
       }
       // Grabbing a Shift-selected corner drags that explicit corner group.
       // Ripper multi-selection does not imply "same corner on every ripper".
+      const selectedVertices = selectedVerticesRef.current;
       const inVertexSelection = selectedVertices.has(key) && selectedVertices.size > 1;
       const group = inVertexSelection
         ? vertexRefsFromKeys(selectedVertices)
@@ -344,7 +357,7 @@ export function CanvasWorkspace(props: CanvasWorkspaceProps): ReactElement {
     const curveHit = hitCurveHandle(world, rippers, props.view.zoom, props.selectedRipperId);
     if (curveHit && props.onSetEdgeCurve && props.onSelectRipper) {
       props.onSelectRipper(curveHit.ripper.id);
-      if (selectedVertices.size > 0) setSelectedVertices(new Set());
+      if (selectedVerticesRef.current.size > 0) setSelectedVertices(new Set());
       const controls = edgeControls(curveHit.ripper, curveHit.edge);
       dragRef.current = {
         type: "curveHandle",
@@ -364,7 +377,7 @@ export function CanvasWorkspace(props: CanvasWorkspaceProps): ReactElement {
       const edgeHit = hitEdge(world, rippers, props.view.zoom);
       if (edgeHit) {
         props.onSelectRipper(edgeHit.ripper.id);
-        if (selectedVertices.size > 0) setSelectedVertices(new Set());
+        if (selectedVerticesRef.current.size > 0) setSelectedVertices(new Set());
         const p0 = edgeHit.ripper.points[edgeHit.edge]!;
         const p3 = edgeHit.ripper.points[(edgeHit.edge + 1) % 4]!;
         dragRef.current = { type: "createCurve", id: edgeHit.ripper.id, edge: edgeHit.edge, p0, p3 };
@@ -381,7 +394,7 @@ export function CanvasWorkspace(props: CanvasWorkspaceProps): ReactElement {
         ? selectedRipperIds
         : [ripperHit.id];
       if (groupIds.length === 1) props.onSelectRipper(ripperHit.id);
-      if (selectedVertices.size > 0) setSelectedVertices(new Set());
+      if (selectedVerticesRef.current.size > 0) setSelectedVertices(new Set());
       dragRef.current = { type: "ripper", id: ripperHit.id, ids: groupIds, lastWorld: world };
       props.onRipperEditStart?.(ripperHit.id, groupIds);
       setCanvasCursor(canvas, "grabbing");
@@ -424,7 +437,7 @@ export function CanvasWorkspace(props: CanvasWorkspaceProps): ReactElement {
 
     props.onSelectImage(undefined);
     props.onSelectRipper?.(undefined);
-    if (selectedVertices.size > 0) setSelectedVertices(new Set());
+    if (selectedVerticesRef.current.size > 0) setSelectedVertices(new Set());
     dragRef.current = { type: "pan", startPointer: { x: event.clientX, y: event.clientY }, startPan: props.view.pan };
     setCanvasCursor(canvas, "grabbing");
   };
@@ -485,7 +498,7 @@ export function CanvasWorkspace(props: CanvasWorkspaceProps): ReactElement {
         const rect = canvas.getBoundingClientRect();
         marqueeRef.current.x1 = event.clientX - rect.left;
         marqueeRef.current.y1 = event.clientY - rect.top;
-        renderNow();
+        renderNowRef.current();
       }
       return;
     }
@@ -671,23 +684,29 @@ function drawWorkspace(
   }
 
   const live = props.livePreview?.current ?? null;
+  const viewZoom = props.view.zoom;
+  const selectedImageIds = props.selectedImageIds ?? (props.selectedImageId ? [props.selectedImageId] : []);
+  const selectedImageIdSet = new Set(selectedImageIds);
+  const selectedRipperIds = props.selectedRipperIds ?? (props.selectedRipperId ? [props.selectedRipperId] : []);
+  const selectedRipperIdSet = new Set(selectedRipperIds);
   for (const image of props.images) {
     const usingLive = live !== null && live.imageId === image.id;
     const cached = cachedImageSource(image, cache, () => {
       if (props.livePreview?.current?.imageId === image.id) props.onLivePreviewCached?.(image.id);
       onCacheReady();
     });
+    const imagePixels = image.image;
     const bitmap = usingLive ? live.canvas : cached?.source ?? null;
-    const pixelWidth = usingLive ? live.width : image.image.width;
-    const pixelHeight = usingLive ? live.height : image.image.height;
+    const pixelWidth = usingLive ? live.width : imagePixels.width;
+    const pixelHeight = usingLive ? live.height : imagePixels.height;
     // Draw the texture centred on its world position, rotating the canvas about
     // that centre. Flips are applied as a sign scale so the drawn size stays
     // positive; at rotation 0 with no flip this matches the old top-left blit.
     const center = worldToScreen(image.position, canvas, props.view);
-    const width = pixelWidth * Math.abs(image.scale.x) * props.view.zoom;
-    const height = pixelHeight * Math.abs(image.scale.y) * props.view.zoom;
+    const width = pixelWidth * Math.abs(image.scale.x) * viewZoom;
+    const height = pixelHeight * Math.abs(image.scale.y) * viewZoom;
     ctx.save();
-    ctx.imageSmoothingEnabled = props.view.zoom <= 1;
+    ctx.imageSmoothingEnabled = viewZoom <= 1;
     ctx.translate(center.x, center.y);
     // World rotation is CCW; screen y is flipped, so negate it for the canvas.
     if (image.rotation) ctx.rotate(-image.rotation);
@@ -697,8 +716,7 @@ function drawWorkspace(
     } else {
       drawImageLoadingPlaceholder(ctx, -width / 2, -height / 2, width, height);
     }
-    const selectedImageIds = props.selectedImageIds ?? (props.selectedImageId ? [props.selectedImageId] : []);
-    if (selectedImageIds.includes(image.id)) {
+    if (selectedImageIdSet.has(image.id)) {
       ctx.strokeStyle = "#2f7d6d";
       ctx.lineWidth = 2;
       ctx.strokeRect(-width / 2, -height / 2, width, height);
@@ -707,9 +725,8 @@ function drawWorkspace(
   }
 
   if (props.rippers) {
-    const selectedRipperIds = props.selectedRipperIds ?? (props.selectedRipperId ? [props.selectedRipperId] : []);
     for (const ripper of props.rippers) {
-      drawRipper(ctx, canvas, props.view, ripper, selectedRipperIds.includes(ripper.id), time, selectedVertices);
+      drawRipper(ctx, canvas, props.view, ripper, selectedRipperIdSet.has(ripper.id), time, selectedVertices);
     }
   }
 

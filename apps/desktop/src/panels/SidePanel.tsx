@@ -222,6 +222,7 @@ export function SidePanel(props: SidePanelProps): ReactElement {
                 <div className="seam-preset-row">
                   <div className="seam-select seam-select--grow">
                     <select
+                      aria-label="Effect preset"
                       value={selectedPresetId}
                       onChange={(event) => setSelectedPresetId(event.target.value)}
                     >
@@ -239,6 +240,7 @@ export function SidePanel(props: SidePanelProps): ReactElement {
                   <input
                     className="seam-preset-input"
                     type="text"
+                    aria-label="Preset name"
                     placeholder="Name this effect set"
                     value={presetName}
                     disabled={disabled}

@@ -24,6 +24,12 @@ interface TiledPanelProps {
   onExtend(id: string, edge: PanelEdge): void;
 }
 
+function findPanelIdAt(clientX: number, clientY: number): string | null {
+  const element = document.elementFromPoint(clientX, clientY);
+  const panel = element?.closest<HTMLElement>("[data-panel-id]");
+  return panel?.dataset.panelId ?? null;
+}
+
 // Tiled panels never float: geometry is owned entirely by the CSS grid via
 // `grid-area: slotN`. Dragging the heading only reorders which panel fills
 // which slot; it never produces an arbitrary x/y/width/height frame.
@@ -45,12 +51,6 @@ export function TiledPanel(props: TiledPanelProps): ReactElement {
     if (ghostFrame.current !== 0) window.cancelAnimationFrame(ghostFrame.current);
     removeDragListeners();
   }, []);
-
-  const findPanelIdAt = (clientX: number, clientY: number): string | null => {
-    const element = document.elementFromPoint(clientX, clientY);
-    const panel = element?.closest<HTMLElement>("[data-panel-id]");
-    return panel?.dataset.panelId ?? null;
-  };
 
   const reportTarget = (targetId: string | null) => {
     const nextTarget = targetId === props.id ? null : targetId;

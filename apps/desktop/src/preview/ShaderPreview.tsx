@@ -118,5 +118,5 @@ export function ShaderPreview(): ReactElement {
     };
   }, []);
 
-  return <canvas ref={canvasRef} className="seam-shader" aria-hidden="true" />;
+  return <canvas ref={canvasRef} className="seam-shader" role="img" aria-label="Animated texture preview placeholder" />;
 }

@@ -150,7 +150,7 @@ export function TexturePreview({ image, settings, version, computeAdjusted }: Te
       cancelled = true;
       timers.forEach((queuedTimer) => window.clearTimeout(queuedTimer));
     };
-  }, [image, version, settingsKey, computeAdjusted]);
+  }, [image, version, settings, settingsKey, computeAdjusted]);
 
   useEffect(() => () => {
     disposePixelImageSource(sourceCanvas.current);

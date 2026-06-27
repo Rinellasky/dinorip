@@ -82,6 +82,7 @@ export function AtlasToolbar(props: AtlasToolbarProps): ReactElement {
         <button
           type="button"
           className={`atlas-size__square${props.square ? " is-active" : ""}`}
+          aria-label={props.square ? "Disable square atlas padding" : "Enable square atlas padding"}
           aria-pressed={props.square}
           onClick={props.onToggleSquare}
           title="Pad export to a square"
