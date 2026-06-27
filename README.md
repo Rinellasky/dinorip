@@ -49,10 +49,12 @@ reference images.
 | Move the ripper | Drag inside the ripper | ![Move the ripper demo](assets/shortcuts/move-ripper.gif) |
 | Move a corner | Drag a corner | ![Move a corner demo](assets/shortcuts/move-corner.gif) |
 | Scale the ripper | ⌘/Ctrl + drag a corner | ![Scale the ripper demo](assets/shortcuts/scale-ripper.gif) |
+| Add a corner | Middle-click an edge |  |
+| Delete a corner | Middle-click a corner, or Alt/Option + click a corner |  |
 | Bend an edge | ⌘/Ctrl + drag an edge | ![Bend an edge demo](assets/shortcuts/bend-edge.gif) |
 | Reshape a curve | Drag a curve handle |  |
 | Remove a curve | Double-click a curve handle |  |
-| Add/remove a corner | ⇧ + click a corner |  |
+| Select/deselect a corner | ⇧ + click a corner |  |
 | Move selected corners | Drag a selected corner |  |
 | Marquee-select corners | ⇧ + drag empty canvas |  |
 | Move a source image | ⇧ + drag the image |  |

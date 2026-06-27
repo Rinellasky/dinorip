@@ -23,11 +23,17 @@ import {
   edgeControls,
   findOwnerImageIndex,
   inferExtractionSize,
+  isQuadRipper,
+  RIPPER_OUTLINE_POINT_LIMIT,
   ripperBounds,
   ripperOutlinePoints,
+  ripperOutlineSegmentsPerEdge,
   shouldConserve
 } from "@dinorip/core";
-import type { ExtractionResult, PixelImage, PlacedImage, PolygonRipper } from "@dinorip/core";
+import type { ExtractionResult, PixelImage, PlacedImage, PolygonRipper, Vec2 } from "@dinorip/core";
+
+const GPU_OUTLINE_LIMIT = RIPPER_OUTLINE_POINT_LIMIT;
+const GPU_FRAGMENT_UNIFORM_HEADROOM = 40;
 
 const VERTEX_SHADER = `#version 300 es
 in vec2 aPos;
@@ -62,7 +68,7 @@ uniform vec2 uImgSize;
 // world bounding box and zero alpha outside the flattened outline polygon.
 uniform int uConserve;          // 0 = rectify (Coons), 1 = conserve cutout
 uniform vec4 uBBox;             // (xMin, yMin, xMax, yMax)
-uniform vec2 uOutline[32];      // flattened outline (world space)
+uniform vec2 uOutline[${GPU_OUTLINE_LIMIT}];      // flattened outline (world space)
 uniform int uOutlineCount;
 vec2 cubic(vec2 p0, vec2 c1, vec2 c2, vec2 p3, float t) {
   float mt = 1.0 - t;
@@ -72,7 +78,7 @@ vec2 cubic(vec2 p0, vec2 c1, vec2 c2, vec2 p3, float t) {
 bool insideOutline(vec2 p) {
   bool inside = false;
   vec2 prev = uOutline[uOutlineCount - 1];
-  for (int i = 0; i < 32; i++) {
+  for (int i = 0; i < ${GPU_OUTLINE_LIMIT}; i++) {
     if (i >= uOutlineCount) break;
     vec2 cur = uOutline[i];
     if (((cur.y > p.y) != (prev.y > p.y)) &&
@@ -170,6 +176,13 @@ function init(): GpuContext | null {
       antialias: false
     });
     if (!gl) throw new Error("WebGL2 is unavailable.");
+    const maxFragmentUniformVectors = gl.getParameter(gl.MAX_FRAGMENT_UNIFORM_VECTORS);
+    if (
+      typeof maxFragmentUniformVectors === "number" &&
+      maxFragmentUniformVectors < GPU_OUTLINE_LIMIT + GPU_FRAGMENT_UNIFORM_HEADROOM
+    ) {
+      throw new Error(`WebGL2 fragment uniform budget too small (${maxFragmentUniformVectors}).`);
+    }
 
     const program = gl.createProgram();
     if (!program) throw new Error("Unable to create program.");
@@ -306,14 +319,27 @@ function drawWarp(
   width: number,
   height: number,
   flipY: number
-): void {
+): boolean {
   const { gl } = ctx;
-  const [topLeft, topRight, bottomRight, bottomLeft] = ripper.points;
+  const conserve = shouldConserve(ripper);
+  if (!conserve && !isQuadRipper(ripper)) return false;
+  const p0 = ripper.points[0];
+  const p1 = ripper.points[1];
+  const p2 = ripper.points[2];
+  const p3 = ripper.points[3];
+  if (!p0 || !p1 || !p2) return false;
+  // The quad uniforms are ignored in conserve mode. For triangles, fill the
+  // fourth value with p2 so the uniform upload remains defined.
+  const topLeft = p0;
+  const topRight = p1;
+  const bottomRight = p2;
+  const bottomLeft = p3 ?? p2;
   // Cubic controls for each edge, defaulting to the 1/3-2/3 straight-line points.
-  const [top1, top2] = edgeControls(ripper, 0);
-  const [right1, right2] = edgeControls(ripper, 1);
-  const [bottom1, bottom2] = edgeControls(ripper, 2);
-  const [left1, left2] = edgeControls(ripper, 3);
+  const quad = isQuadRipper(ripper);
+  const [top1, top2] = quad ? edgeControls(ripper, 0) : ([topLeft, topRight] as [Vec2, Vec2]);
+  const [right1, right2] = quad ? edgeControls(ripper, 1) : ([topRight, bottomRight] as [Vec2, Vec2]);
+  const [bottom1, bottom2] = quad ? edgeControls(ripper, 2) : ([bottomRight, bottomLeft] as [Vec2, Vec2]);
+  const [left1, left2] = quad ? edgeControls(ripper, 3) : ([bottomLeft, topLeft] as [Vec2, Vec2]);
   const scaleX = owner.scale.x === 0 ? 1 : owner.scale.x;
   const scaleY = owner.scale.y === 0 ? 1 : owner.scale.y;
   const sourceTexture = uploadSource(ctx, owner.image);
@@ -339,11 +365,12 @@ function drawWarp(
 
   // Conserve (shape-preserving cutout) mode: feed the outline polygon + bbox so
   // the fragment shader samples in place and masks outside the curve.
-  const conserve = shouldConserve(ripper);
   gl.uniform1i(u.uConserve ?? null, conserve ? 1 : 0);
   if (conserve) {
     const { xMin, xMax, yMin, yMax } = ripperBounds(ripper);
-    const outline = ripperOutlinePoints(ripper);
+    const segmentsPerEdge = ripperOutlineSegmentsPerEdge(ripper.points.length, GPU_OUTLINE_LIMIT);
+    const outline = ripperOutlinePoints(ripper, segmentsPerEdge);
+    if (outline.length > GPU_OUTLINE_LIMIT) return false;
     const flat = new Float32Array(outline.length * 2);
     outline.forEach((point, index) => {
       flat[index * 2] = point.x;
@@ -363,6 +390,7 @@ function drawWarp(
   gl.clearColor(0, 0, 0, 0);
   gl.clear(gl.COLOR_BUFFER_BIT);
   gl.drawArrays(gl.TRIANGLES, 0, 6);
+  return true;
 }
 
 /**
@@ -392,7 +420,7 @@ export function gpuExtractPerspective(
 
     resizeOutput(ctx, width, height);
     gl.bindFramebuffer(gl.FRAMEBUFFER, ctx.framebuffer);
-    drawWarp(ctx, ripper, owner, width, height, -1);
+    if (!drawWarp(ctx, ripper, owner, width, height, -1)) return null;
 
     // Flipped in-shader, so readPixels' bottom-up rows are already top-down.
     const out = new Uint8ClampedArray(width * height * 4);
@@ -451,7 +479,7 @@ export function gpuRenderLivePreview(
     }
 
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    drawWarp(ctx, ripper, owner, renderWidth, renderHeight, 1);
+    if (!drawWarp(ctx, ripper, owner, renderWidth, renderHeight, 1)) return null;
     gl.flush();
 
     return { canvas, width: full.width, height: full.height };

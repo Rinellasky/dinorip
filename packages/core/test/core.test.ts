@@ -5,6 +5,7 @@ import {
   computeAtlasBounds,
   createRipper,
   cubicBezier,
+  deleteRipperPoint,
   edgeControls,
   extractPerspective,
   findOwnerImageIndex,
@@ -14,6 +15,7 @@ import {
   getPixel,
   imageFromRgba,
   inferExtractionSize,
+  insertRipperPoint,
   makeImage,
   makeSeamless,
   offsetWrap,
@@ -21,6 +23,9 @@ import {
   packAtlasPositions,
   pointInsidePolygon,
   rasterizeAtlas,
+  RIPPER_OUTLINE_POINT_LIMIT,
+  ripperOutlinePoints,
+  ripperOutlineSegmentsPerEdge,
   sampleBilinear,
   snapAtlasItem,
   setPixel
@@ -190,6 +195,91 @@ describe("perspective extraction", () => {
     const bottomPixel = getPixel(res!.image, cx, res!.image.height - 1); // bottom → green
     expect(topPixel.r).toBeGreaterThan(topPixel.g);
     expect(bottomPixel.g).toBeGreaterThan(bottomPixel.r);
+  });
+
+  it("uses the shared outline sampling resolution by default", () => {
+    const ripper = createRipper({ x: 0, y: 0 }, 10);
+    ripper.edgeCurves = ripper.points.map((point, index) => {
+      const next = ripper.points[(index + 1) % ripper.points.length]!;
+      return [
+        { x: point.x + (next.x - point.x) / 3, y: point.y + 1 },
+        { x: point.x + (2 * (next.x - point.x)) / 3, y: next.y + 1 }
+      ] as const;
+    });
+    const segments = ripperOutlineSegmentsPerEdge(ripper.points.length);
+
+    expect(segments).toBe(Math.floor(RIPPER_OUTLINE_POINT_LIMIT / ripper.points.length));
+    expect(ripperOutlinePoints(ripper)).toHaveLength(ripper.points.length * segments);
+  });
+
+  it("extracts a three-point ripper as a transparent polygon cutout", () => {
+    const owner = { image: makeImage(20, 20, opaque(40, 80, 120)), position: { x: 0, y: 0 }, scale: { x: 1, y: 1 } };
+    const ripper = {
+      points: [
+        { x: 0, y: 5 },
+        { x: 5, y: -5 },
+        { x: -5, y: -5 }
+      ]
+    };
+
+    expect(shouldConserve(ripper)).toBe(true);
+    expect(inferExtractionSize(ripper)).toEqual({ width: 16, height: 16 });
+    const result = extractPerspective(ripper, [owner]);
+
+    expect(result).not.toBeNull();
+    expect(getPixel(result!.image, 0, 0).a).toBe(0);
+    const cx = Math.floor(result!.image.width / 2);
+    const cy = Math.floor(result!.image.height / 2);
+    expect(getPixel(result!.image, cx, cy).a).toBe(255);
+  });
+
+  it("uses points beyond the first four when extracting a polygon cutout", () => {
+    const owner = { image: makeImage(30, 30, opaque(20, 160, 90)), position: { x: 0, y: 0 }, scale: { x: 1, y: 1 } };
+    const ripper = {
+      points: [
+        { x: 0, y: 10 },
+        { x: 10, y: 2 },
+        { x: 7, y: -10 },
+        { x: 0, y: -14 },
+        { x: -7, y: -10 },
+        { x: -10, y: 2 }
+      ]
+    };
+
+    const result = extractPerspective(ripper, [owner]);
+    expect(result).not.toBeNull();
+    const bottomCenter = getPixel(result!.image, Math.floor(result!.image.width / 2), result!.image.height - 2);
+    const bottomLeft = getPixel(result!.image, 1, result!.image.height - 2);
+    expect(bottomCenter.a).toBe(255);
+    expect(bottomLeft.a).toBe(0);
+  });
+
+  it("inserts and deletes polygon points while preserving the three-corner minimum", () => {
+    const quad = createRipper({ x: 0, y: 0 }, 10);
+    const fivePoint = insertRipperPoint(quad, 0);
+    expect(fivePoint.points).toHaveLength(5);
+    expect(fivePoint.points[1]?.x).toBeCloseTo(0);
+    expect(fivePoint.points[1]?.y).toBeCloseTo(5);
+
+    const triangle = deleteRipperPoint(deleteRipperPoint(fivePoint, 1), 1);
+    expect(triangle.points).toHaveLength(3);
+    expect(deleteRipperPoint(triangle, 0).points).toHaveLength(3);
+  });
+
+  it("splits a curved edge when inserting a polygon point", () => {
+    const ripper = createRipper({ x: 0, y: 0 }, 10);
+    ripper.edgeCurves = [
+      [{ x: -2, y: 8 }, { x: 2, y: 8 }],
+      null,
+      null,
+      null
+    ];
+
+    const inserted = insertRipperPoint(ripper, 0);
+    expect(inserted.points).toHaveLength(5);
+    expect(inserted.edgeCurves?.[0]).not.toBeNull();
+    expect(inserted.edgeCurves?.[1]).not.toBeNull();
+    expect(inserted.points[1]?.y).toBeGreaterThan(5);
   });
 
   it("selects the best owner image, including scaled and offset images", () => {

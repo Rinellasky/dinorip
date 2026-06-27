@@ -5,12 +5,16 @@ import type { MenuCommand } from "@dinorip/ipc-contracts";
 import {
   computeAtlasBounds,
   createRipper,
+  deleteRipperPoint,
   packAtlasPositions,
+  findOwnerImageIndex,
   flipVertical,
   getPixel,
+  insertRipperPoint,
   inferExtractionSize,
   isRipperCurved,
   makeImage,
+  MIN_RIPPER_POINTS,
   setPixel,
   shouldConserve
 } from "@dinorip/core";
@@ -133,9 +137,13 @@ interface AppState extends HistorySnapshot {
 // to support functional updaters, so adding function-valued state would need a
 // different action shape.
 type AppStateValue<K extends keyof AppState> = AppState[K] | ((current: AppState[K]) => AppState[K]);
+type RefMirroredAppStateKey = "sourceImages" | "rippers";
+type PlainAppStateKey = Exclude<keyof AppState, RefMirroredAppStateKey>;
+type AppStateSetAction<K extends keyof AppState> = { type: "set"; key: K; value: AppStateValue<K> };
 
 type AppStateAction =
-  | { [K in keyof AppState]-?: { type: "set"; key: K; value: AppStateValue<K> } }[keyof AppState]
+  | { [K in PlainAppStateKey]-?: AppStateSetAction<K> }[PlainAppStateKey]
+  | { [K in RefMirroredAppStateKey]-?: AppStateSetAction<K> & { refMirrored: true } }[RefMirroredAppStateKey]
   | { type: "resetBenchmarkWorkspace" };
 
 const initialAppState: AppState = {
@@ -180,6 +188,10 @@ function appStateReducer(state: AppState, action: AppStateAction): AppState {
     };
   }
 
+  // `sourceImages` and `rippers` are mirrored into refs so pointer-up
+  // finalization can read geometry before React commits the next render. Any
+  // reducer write to those keys must go through setSourceImages/setRippers, or
+  // must update the matching ref before dispatching.
   const current = state[action.key];
   const value = action.value;
   const next = typeof value === "function" ? (value as (currentValue: typeof current) => typeof current)(current) : value;
@@ -294,14 +306,26 @@ function useApp(): ReactElement {
     undoStack,
     redoStack
   } = appState;
-  const setAppState = <K extends keyof AppState>(key: K, value: AppStateValue<K>) => {
+  const setAppState = <K extends PlainAppStateKey>(key: K, value: AppStateValue<K>) => {
     dispatchAppState({ type: "set", key, value } as AppStateAction);
   };
-  // Setter wrappers intentionally close only over reducer dispatch. Keep them
-  // state-free so callbacks that capture them behave like useState setters.
-  const setSourceImages = (value: AppStateValue<"sourceImages">) => setAppState("sourceImages", value);
+  // Setter wrappers mirror React state into refs immediately, so pointer-up
+  // finalization can bake the newest geometry even before the next render lands.
+  const setSourceImages = (value: AppStateValue<"sourceImages">) => {
+    const next = typeof value === "function"
+      ? (value as (current: WorkspaceImageState[]) => WorkspaceImageState[])(latestSourceImagesRef.current)
+      : value;
+    latestSourceImagesRef.current = next;
+    dispatchAppState({ type: "set", key: "sourceImages", value: next, refMirrored: true });
+  };
   const setAtlasImages = (value: AppStateValue<"atlasImages">) => setAppState("atlasImages", value);
-  const setRippers = (value: AppStateValue<"rippers">) => setAppState("rippers", value);
+  const setRippers = (value: AppStateValue<"rippers">) => {
+    const next = typeof value === "function"
+      ? (value as (current: RipperState[]) => RipperState[])(latestRippersRef.current)
+      : value;
+    latestRippersRef.current = next;
+    dispatchAppState({ type: "set", key: "rippers", value: next, refMirrored: true });
+  };
   const setSelectedSourceImageId = (value: AppStateValue<"selectedSourceImageId">) => setAppState("selectedSourceImageId", value);
   const setSelectedAtlasImageId = (value: AppStateValue<"selectedAtlasImageId">) => setAppState("selectedAtlasImageId", value);
   const setSelectedRipperId = (value: AppStateValue<"selectedRipperId">) => setAppState("selectedRipperId", value);
@@ -318,6 +342,8 @@ function useApp(): ReactElement {
   const setUndoStack = (value: AppStateValue<"undoStack">) => setAppState("undoStack", value);
   const setRedoStack = (value: AppStateValue<"redoStack">) => setAppState("redoStack", value);
   const currentProjectPathRef = useRef<string | undefined>(undefined);
+  const latestSourceImagesRef = useRef<WorkspaceImageState[]>(sourceImages);
+  const latestRippersRef = useRef<RipperState[]>(rippers);
   const tilesRef = useRef<HTMLDivElement | null>(null);
   const workerRef = useRef<Worker | null>(null);
   const resizeFrame = useRef(0);
@@ -346,6 +372,9 @@ function useApp(): ReactElement {
   // records none).
   const interactionSnapshot = useRef<HistorySnapshot | null>(null);
 
+  latestSourceImagesRef.current = sourceImages;
+  latestRippersRef.current = rippers;
+
   function updateCurrentProjectPath(path: string | undefined) {
     currentProjectPathRef.current = path;
   }
@@ -373,9 +402,9 @@ function useApp(): ReactElement {
 
   function snapshot(): HistorySnapshot {
     return {
-      sourceImages,
+      sourceImages: latestSourceImagesRef.current,
       atlasImages,
-      rippers,
+      rippers: latestRippersRef.current,
       selectedSourceImageId,
       selectedAtlasImageId,
       selectedRipperId,
@@ -472,6 +501,8 @@ function useApp(): ReactElement {
         editStartSignatureRef.current = null;
         interactionSnapshot.current = null;
         updateCurrentProjectPath(undefined);
+        latestSourceImagesRef.current = [];
+        latestRippersRef.current = [];
         dispatchAppState({ type: "resetBenchmarkWorkspace" });
       }
     };
@@ -1139,20 +1170,24 @@ function useApp(): ReactElement {
       return;
     }
     const extracted: ResolvedExtraction[] = [];
+    let sawNullResult = false;
     for (const job of jobs) {
       if (autoExtractRun.current !== runId) {
         recordStaleExtractionSkipped();
         return;
       }
+      const ownerIndex = findOwnerImageIndex(job.ripper, sourceItems);
+      if (ownerIndex < 0) continue;
       const started = performance.now();
       const result = gpuExtractPerspective(job.ripper, sourceItems);
       recordSyncExtraction(performance.now() - started);
       if (result) extracted.push({ ...job, result });
+      else sawNullResult = true;
     }
     if (autoExtractRun.current !== runId) return;
-    // If the GPU context died mid-draw it produces nothing and reports itself
-    // unavailable; fall back to the worker for this update.
-    if (extracted.length === 0 && jobs.length > 0 && !isGpuExtractAvailable()) {
+    // Ownerless rippers are legitimately empty. Only fall back when an owned
+    // ripper failed to draw, which means the GPU path could not render it.
+    if (sawNullResult && jobs.length > 0) {
       void autoExtractRippers(runId, ripperSnapshot, sourceSnapshot, selectedRipperSnapshot);
       return;
     }
@@ -1374,7 +1409,7 @@ function useApp(): ReactElement {
     setRippers((current) => current.map((ripper) => ripper.id === id
       ? {
           ...ripper,
-          points: ripper.points.map((point) => ({ x: point.x + delta.x, y: point.y + delta.y })) as RipperState["points"],
+          points: ripper.points.map((point) => ({ x: point.x + delta.x, y: point.y + delta.y })),
           // Translate the curve control points too, so curved edges move with the
           // body instead of being left behind.
           edgeCurves: ripper.edgeCurves?.map((curve) => curve
@@ -1392,7 +1427,7 @@ function useApp(): ReactElement {
     setRippers((current) => current.map((ripper) => idSet.has(ripper.id)
       ? {
           ...ripper,
-          points: ripper.points.map((point) => ({ x: point.x + delta.x, y: point.y + delta.y })) as RipperState["points"],
+          points: ripper.points.map((point) => ({ x: point.x + delta.x, y: point.y + delta.y })),
           edgeCurves: ripper.edgeCurves?.map((curve) => curve
             ? [
                 { x: curve[0].x + delta.x, y: curve[0].y + delta.y },
@@ -1406,7 +1441,7 @@ function useApp(): ReactElement {
   function moveVertex(id: string, index: number, point: Vec2) {
     setRippers((current) => current.map((ripper) => {
       if (ripper.id !== id) return ripper;
-      const points = [...ripper.points] as RipperState["points"];
+      const points = [...ripper.points];
       points[index] = point;
       return { ...ripper, points };
     }));
@@ -1419,10 +1454,40 @@ function useApp(): ReactElement {
     setRippers((current) => current.map((ripper) => {
       const mine = updates.filter((update) => update.id === ripper.id);
       if (mine.length === 0) return ripper;
-      const points = [...ripper.points] as RipperState["points"];
+      const points = [...ripper.points];
       for (const update of mine) points[update.index] = update.point;
       return { ...ripper, points };
     }));
+  }
+
+  function insertVertex(id: string, edge: number) {
+    const target = latestRippersRef.current.find((ripper) => ripper.id === id);
+    if (!target) return;
+    commitHistory();
+    setRippers((current) => current.map((ripper) => ripper.id === id ? insertRipperPoint(ripper, edge) : ripper));
+    setSelectedRipperId(id);
+    setSelectedRipperIds([id]);
+    setSelectedSourceImageId(undefined);
+    setSelectedAtlasImageId(target.outputImageId);
+    setSelectedAtlasImageIds(target.outputImageId ? [target.outputImageId] : []);
+    setStatus("Corner added");
+  }
+
+  function deleteVertex(id: string, index: number) {
+    const target = latestRippersRef.current.find((ripper) => ripper.id === id);
+    if (!target) return;
+    if (target.points.length <= MIN_RIPPER_POINTS) {
+      setStatus(`Rippers need at least ${MIN_RIPPER_POINTS} corners`);
+      return;
+    }
+    commitHistory();
+    setRippers((current) => current.map((ripper) => ripper.id === id ? deleteRipperPoint(ripper, index) : ripper));
+    setSelectedRipperId(id);
+    setSelectedRipperIds([id]);
+    setSelectedSourceImageId(undefined);
+    setSelectedAtlasImageId(target.outputImageId);
+    setSelectedAtlasImageIds(target.outputImageId ? [target.outputImageId] : []);
+    setStatus("Corner deleted");
   }
 
   // Set (or replace) the cubic controls of one ripper edge. Used live while
@@ -1431,7 +1496,7 @@ function useApp(): ReactElement {
   function setEdgeCurve(id: string, edge: number, controls: readonly [Vec2, Vec2]) {
     setRippers((current) => current.map((ripper) => {
       if (ripper.id !== id) return ripper;
-      const edgeCurves = [...(ripper.edgeCurves ?? [null, null, null, null])];
+      const edgeCurves = Array.from({ length: ripper.points.length }, (_, index) => ripper.edgeCurves?.[index] ?? null);
       edgeCurves[edge] = controls;
       return { ...ripper, edgeCurves };
     }));
@@ -1446,7 +1511,7 @@ function useApp(): ReactElement {
     commitHistory();
     setRippers((current) => current.map((ripper) => {
       if (ripper.id !== id) return ripper;
-      const edgeCurves = [...(ripper.edgeCurves ?? [null, null, null, null])];
+      const edgeCurves = Array.from({ length: ripper.points.length }, (_, index) => ripper.edgeCurves?.[index] ?? null);
       edgeCurves[edge] = null;
       return { ...ripper, edgeCurves };
     }));
@@ -1558,11 +1623,12 @@ function useApp(): ReactElement {
   function onRipperEditStart(id: string, editedIdsOverride?: string[]) {
     beginInteraction();
     editingRipperIdRef.current = id;
+    const latestRippers = latestRippersRef.current;
     const editedIds = editedIdsOverride && editedIdsOverride.length > 0
       ? editedIdsOverride
       : selectedRipperIds.length > 1 && selectedRipperIds.includes(id) ? selectedRipperIds : [id];
     editingRipperIdsRef.current = editedIds;
-    editStartSignatureRef.current = ripperSignaturesForIds(rippers, editedIds);
+    editStartSignatureRef.current = ripperSignaturesForIds(latestRippers, editedIds);
     // Show the last committed pixels until the first live frame is rendered.
     clearLivePreviews();
   }
@@ -1576,13 +1642,15 @@ function useApp(): ReactElement {
     editStartSignatureRef.current = null;
     endInteraction();
     if (!editedId) return;
+    const latestRippers = latestRippersRef.current;
+    const latestSourceImages = latestSourceImagesRef.current;
     // A click that only selects a ripper (pointer down then up with no move)
     // changes no geometry. Re-extracting then would do a full-resolution GPU
     // readback and re-rasterize the atlas texture for nothing — the lag felt
     // when clicking a ripper over a large image. Skip the commit when the
     // ripper is unchanged; the live preview was never shown, so the committed
     // pixels are already on screen.
-    const endSignature = ripperSignaturesForIds(rippers, editedIds);
+    const endSignature = ripperSignaturesForIds(latestRippers, editedIds);
     const unchanged = startSignature != null && endSignature === startSignature;
     if (unchanged) {
       clearLivePreviews();
@@ -1592,11 +1660,11 @@ function useApp(): ReactElement {
       const previewImageId = livePreviewRef.current?.imageId;
       const runId = autoExtractRun.current + 1;
       autoExtractRun.current = runId;
-      void autoExtractRippers(runId, rippers, sourceImages, selectedRipperId);
+      void autoExtractRippers(runId, latestRippers, latestSourceImages, selectedRipperIdRef.current);
       scheduleLivePreviewFallback(previewImageId);
       return;
     }
-    void commitRipper(editedId, rippers, sourceImages);
+    void commitRipper(editedId, latestRippers, latestSourceImages);
   }
 
   // Moving a placed image is a single undo step: snapshot at pointer-down,
@@ -1637,7 +1705,8 @@ function useApp(): ReactElement {
     const useGpuCommit = isGpuExtractAvailable() && outputSize.pixels <= GPU_COMMIT_PIXEL_LIMIT;
     if (useGpuCommit) {
       result = gpuExtractPerspective(ripper, toPlacedImages(sourceSnapshot));
-    } else {
+    }
+    if (!result) {
       if (outputSize.pixels > GPU_COMMIT_PIXEL_LIMIT) {
         setStatus(`Finalizing large texture ${outputSize.width} x ${outputSize.height}...`);
       }
@@ -1702,6 +1771,8 @@ function useApp(): ReactElement {
               onMoveRippers={moveRippers}
               onMoveVertex={moveVertex}
               onMoveVertices={moveVertices}
+              onInsertVertex={insertVertex}
+              onDeleteVertex={deleteVertex}
               onSetEdgeCurve={setEdgeCurve}
               onRemoveEdgeCurve={removeEdgeCurve}
               onImageContextMenu={onSourceImageContextMenu}
@@ -2105,10 +2176,11 @@ function snapshotSignature(state: HistorySnapshot): string {
 function ripperSignature(ripper: RipperState): string {
   return [
     ripper.id,
+    `p${ripper.points.length}`,
     ...ripper.points.flatMap((point) => [formatNumber(point.x), formatNumber(point.y)]),
     // Fold in per-edge curve controls so curve create/move/remove re-extracts and
     // registers as a real change for undo detection. "_" marks a straight edge.
-    ...[0, 1, 2, 3].map((edge) => {
+    ...ripper.points.map((_, edge) => {
       const curve = ripper.edgeCurves?.[edge];
       return curve
         ? `${formatNumber(curve[0].x)},${formatNumber(curve[0].y)},${formatNumber(curve[1].x)},${formatNumber(curve[1].y)}`
