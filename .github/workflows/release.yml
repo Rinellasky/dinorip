@@ -54,12 +54,12 @@ jobs:
           - label: macOS arm64
             runner: macos-14
             platform: mac
-            target: dmg
+            target: dmg zip
             arch: arm64
           - label: macOS x64
             runner: macos-15-intel
             platform: mac
-            target: dmg
+            target: dmg zip
             arch: x64
           - label: Linux x64
             runner: ubuntu-latest
@@ -93,7 +93,9 @@ jobs:
       - name: Build desktop installer
         shell: bash
         env:
-          # No code-signing configured; keep electron-builder from trying.
+          # Do not use a Developer ID or self-signed release identity. The app
+          # only checks for new versions and opens the GitHub release page; it
+          # does not try to install updates in-app.
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -145,12 +147,30 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Download all desktop artifacts
         uses: actions/download-artifact@v4
         with:
           pattern: desktop-*
           merge-multiple: true
           path: release-assets
+
+      - name: Merge macOS updater manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for x64_manifest in release-assets/*-mac-x64.yml; do
+            arm64_manifest="${x64_manifest%-x64.yml}.yml"
+            if [[ ! -f "$arm64_manifest" ]]; then
+              echo "Missing matching arm64 manifest for $x64_manifest" >&2
+              exit 1
+            fi
+            node scripts/merge-update-manifests.mjs "$arm64_manifest" "$x64_manifest"
+            rm -f "$x64_manifest"
+          done
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
@@ -161,6 +181,7 @@ jobs:
           make_latest: true
           files: |
             release-assets/*.dmg
+            release-assets/*.zip
             release-assets/*.AppImage
             release-assets/*.exe
             release-assets/*.blockmap

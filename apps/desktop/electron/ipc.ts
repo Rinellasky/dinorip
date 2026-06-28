@@ -26,7 +26,10 @@ const IPC_CHANNELS = {
   openProject: "dinorip:open-project",
   toggleFullscreen: "dinorip:toggle-fullscreen",
   menuCommand: "dinorip:menu-command"
-} as const satisfies typeof Contracts.IPC_CHANNELS;
+} as const satisfies Pick<
+  typeof Contracts.IPC_CHANNELS,
+  "openImages" | "savePng" | "exportAllPng" | "saveProject" | "openProject" | "toggleFullscreen" | "menuCommand"
+>;
 
 const imageFilters = [{ name: "Images", extensions: ["png", "jpg", "jpeg"] }];
 const projectFilters = [{ name: "DinoRip Project", extensions: ["dr"] }];

@@ -33,3 +33,10 @@ pnpm-debug.log*
 .env
 .env.local
 .env.*.local
+
+# Signing material — never commit code-signing keys
+*.p12
+*.pem
+*.cer
+*.keychain
+*.keychain-db

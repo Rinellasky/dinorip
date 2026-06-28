@@ -12,7 +12,26 @@ if (!window.dinorip) {
     saveProject: async () => ({ canceled: true, paths: [] }),
     openProject: async () => ({ canceled: true }),
     onMenuCommand: () => () => {},
-    toggleFullscreen: async () => false
+    toggleFullscreen: async () => false,
+    getUpdateState: async () => ({
+      enabled: false,
+      status: "disabled",
+      currentVersion: "0.0.0",
+      availableVersion: null,
+      checkedAt: null,
+      message: "Automatic updates are only available in the desktop app.",
+      canRetry: false
+    }),
+    checkForUpdate: async () => ({
+      checked: false,
+      state: await window.dinorip.getUpdateState()
+    }),
+    openUpdatePage: async () => ({
+      opened: false,
+      url: "https://github.com/maria-rcks/dinorip/releases/latest",
+      state: await window.dinorip.getUpdateState()
+    }),
+    onUpdateState: () => () => {}
   };
 }
 

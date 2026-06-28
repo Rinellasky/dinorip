@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useMemo, useReducer, useRef } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent, ReactElement } from "react";
 import { VIEWPORT_MAX_ZOOM, VIEWPORT_MIN_ZOOM } from "@dinorip/ipc-contracts";
-import type { MenuCommand } from "@dinorip/ipc-contracts";
+import type { MenuCommand, UpdateState } from "@dinorip/ipc-contracts";
 import {
   computeAtlasBounds,
   createRipper,
@@ -33,6 +33,13 @@ import { usePanelLayout } from "./panels/usePanelLayout";
 import type { LayoutResizePart, PanelId } from "./panels/usePanelLayout";
 import { AtlasToolbar, SourceToolbar } from "./panels/PixelToolbars";
 import { ShortcutsOverlay } from "./panels/ShortcutsOverlay";
+import {
+  getUpdateVersion,
+  isUpdateActionable,
+  shouldShowUpdateModal,
+  UpdateIndicator,
+  UpdateModal
+} from "./panels/UpdateOverlay";
 import { defaultTextureSettings, defaultViewState } from "./renderer/types";
 import type { RipperState, TextureSettings, ViewState, WorkspaceImageState, WorkspaceKind } from "./renderer/types";
 import { cloneForState, fromIpcImage, pixelImageFromBlob, toIpcImage } from "./renderer/imageCanvas";
@@ -285,6 +292,8 @@ export function App(): ReactElement {
 
 function useApp(): ReactElement {
   const [appState, dispatchAppState] = useReducer(appStateReducer, initialAppState);
+  const [updateState, setUpdateState] = useState<UpdateState | null>(null);
+  const [dismissedUpdateVersion, setDismissedUpdateVersion] = useState<string | null>(null);
   const {
     sourceImages,
     atlasImages,
@@ -373,6 +382,29 @@ function useApp(): ReactElement {
 
   latestSourceImagesRef.current = sourceImages;
   latestRippersRef.current = rippers;
+
+  useEffect(() => {
+    let mounted = true;
+    let receivedPush = false;
+    const unsubscribe = window.dinorip.onUpdateState((state) => {
+      receivedPush = true;
+      if (mounted) setUpdateState(state);
+    });
+    void window.dinorip.getUpdateState().then((state) => {
+      if (mounted && !receivedPush) setUpdateState(state);
+    });
+    return () => {
+      mounted = false;
+      unsubscribe();
+    };
+  }, []);
+
+  useEffect(() => {
+    const version = getUpdateVersion(updateState);
+    if (dismissedUpdateVersion && dismissedUpdateVersion !== version) {
+      setDismissedUpdateVersion(null);
+    }
+  }, [dismissedUpdateVersion, updateState]);
 
   function updateCurrentProjectPath(path: string | undefined) {
     currentProjectPathRef.current = path;
@@ -1272,6 +1304,27 @@ function useApp(): ReactElement {
     [runWorker]
   );
   const closeShortcuts = useCallback(() => setShowShortcuts(false), []);
+  const updateModalOpen = shouldShowUpdateModal(updateState, dismissedUpdateVersion);
+  const openUpdateModal = useCallback(() => setDismissedUpdateVersion(null), []);
+  const closeUpdateModal = useCallback(() => {
+    setDismissedUpdateVersion(getUpdateVersion(updateState));
+  }, [updateState]);
+  const handleUpdatePrimaryAction = useCallback(() => {
+    if (!updateState) return;
+    void window.dinorip.openUpdatePage()
+      .then((result) => {
+        setUpdateState(result.state);
+        if (result.opened) {
+          setDismissedUpdateVersion(getUpdateVersion(result.state));
+          return;
+        }
+        setStatus(result.state.message ?? "Could not open update page");
+      })
+      .catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : "Could not open update page";
+        setStatus(message);
+      });
+  }, [updateState]);
 
   async function exportSelected() {
     const images = selectedAtlasImageIds.length > 1
@@ -1735,6 +1788,9 @@ function useApp(): ReactElement {
         <h1>dinorip</h1>
         <span className="app__status">{status}</span>
         <div className="app__toolbar">
+          {isUpdateActionable(updateState) && !updateModalOpen ? (
+            <UpdateIndicator state={updateState} onOpen={openUpdateModal} />
+          ) : null}
           <button
             type="button"
             className="icon-button"
@@ -1921,6 +1977,13 @@ function useApp(): ReactElement {
         );
       })()}
       {showShortcuts && <ShortcutsOverlay onClose={closeShortcuts} />}
+      {updateModalOpen && updateState ? (
+        <UpdateModal
+          state={updateState}
+          onClose={closeUpdateModal}
+          onPrimaryAction={handleUpdatePrimaryAction}
+        />
+      ) : null}
     </main>
   );
 }

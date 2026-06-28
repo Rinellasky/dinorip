@@ -5,7 +5,11 @@ export const IPC_CHANNELS = {
   saveProject: "dinorip:save-project",
   openProject: "dinorip:open-project",
   toggleFullscreen: "dinorip:toggle-fullscreen",
-  menuCommand: "dinorip:menu-command"
+  menuCommand: "dinorip:menu-command",
+  updateState: "dinorip:update-state",
+  getUpdateState: "dinorip:get-update-state",
+  checkForUpdate: "dinorip:check-for-update",
+  openUpdatePage: "dinorip:open-update-page"
 } as const;
 
 export interface IpcPixelImage {
@@ -50,6 +54,35 @@ export interface OpenProjectResult {
   contents?: string;
 }
 
+export type UpdateStatus =
+  | "disabled"
+  | "idle"
+  | "checking"
+  | "up-to-date"
+  | "available"
+  | "error";
+
+export interface UpdateState {
+  enabled: boolean;
+  status: UpdateStatus;
+  currentVersion: string;
+  availableVersion: string | null;
+  checkedAt: string | null;
+  message: string | null;
+  canRetry: boolean;
+}
+
+export interface UpdateCheckResult {
+  checked: boolean;
+  state: UpdateState;
+}
+
+export interface OpenUpdatePageResult {
+  opened: boolean;
+  url: string;
+  state: UpdateState;
+}
+
 export type MenuCommand =
   | "open-project"
   | "save-project"
@@ -72,6 +105,10 @@ export interface DinoripApi {
   openProject(): Promise<OpenProjectResult>;
   onMenuCommand(handler: (command: MenuCommand) => void): () => void;
   toggleFullscreen(): Promise<boolean>;
+  getUpdateState(): Promise<UpdateState>;
+  checkForUpdate(): Promise<UpdateCheckResult>;
+  openUpdatePage(): Promise<OpenUpdatePageResult>;
+  onUpdateState(handler: (state: UpdateState) => void): () => void;
 }
 
 export const RIPPER_SIZE = 100;

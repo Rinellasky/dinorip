@@ -157,6 +157,128 @@ svg {
   background: rgba(239, 229, 199, 0.22);
 }
 
+/* Update prompt ------------------------------------------------------------ */
+
+.update-pill {
+  height: 20px;
+  min-height: 0;
+  align-self: center;
+  margin: 0 4px;
+  padding: 0 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: var(--accent);
+  color: var(--black);
+  border: 1px solid var(--black);
+  box-shadow: 1px 1px 0 rgba(8, 9, 8, 0.55);
+  font-size: 10px;
+  text-shadow: none;
+  text-transform: none;
+  letter-spacing: 0;
+  -webkit-app-region: no-drag;
+  animation: update-pulse 1.6s steps(2) infinite;
+}
+
+.update-pill:hover:not(:disabled) {
+  background: var(--accent-2);
+  color: var(--black);
+}
+
+.update-pill:active:not(:disabled) {
+  transform: none;
+  box-shadow: inset 1px 1px 0 rgba(8, 9, 8, 0.55);
+}
+
+.update-pill__dot {
+  width: 6px;
+  height: 6px;
+  background: var(--black);
+  box-shadow: 1px 1px 0 rgba(255, 255, 255, 0.2);
+}
+
+.update-pill__label {
+  line-height: 1;
+}
+
+@keyframes update-pulse {
+  0%,
+  60% {
+    box-shadow: 1px 1px 0 rgba(8, 9, 8, 0.55);
+  }
+
+  61%,
+  100% {
+    box-shadow: 1px 1px 0 rgba(8, 9, 8, 0.55), 0 0 0 2px rgba(239, 229, 199, 0.75);
+  }
+}
+
+.update-modal {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: min(430px, 92vw);
+  background: var(--panel);
+  border: 1px solid var(--black);
+  box-shadow: 4px 4px 0 rgba(8, 9, 8, 0.5);
+}
+
+.update-modal__body {
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.update-modal__lead,
+.update-modal__notes,
+.update-modal__error {
+  margin: 0;
+}
+
+.update-modal__lead {
+  color: var(--ink);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.update-modal__notes,
+.update-modal__error {
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.update-modal__notes {
+  color: var(--ink-muted);
+}
+
+.update-modal__error {
+  color: var(--accent);
+}
+
+.update-modal__footer {
+  padding: 0 14px 14px;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.update-cta {
+  position: relative;
+  min-width: 230px;
+  overflow: hidden;
+  background: var(--accent);
+  color: var(--black);
+}
+
+.update-cta__label {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  text-shadow: none;
+}
+
 /* Tiled workspace: a CSS grid that fills the stage. Panels snap into named
    slots; there are no free-floating frames. Default arrangement: two tiles on
    top (slot0 | slot1) with a full-width tile below (slot2). */

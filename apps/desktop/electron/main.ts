@@ -3,6 +3,7 @@ import type { MenuItemConstructorOptions } from "electron";
 import path from "node:path";
 import sharp from "sharp";
 import { registerIpc } from "./ipc";
+import { checkForUpdatesFromMenu, configureUpdates } from "./updater";
 import type { MenuCommand } from "@dinorip/ipc-contracts";
 
 // Set before the app is ready so the menu bar, About panel, and userData path
@@ -20,12 +21,14 @@ function sendMenuCommand(command: MenuCommand): void {
 
 function installApplicationMenu(): void {
   const isMac = process.platform === "darwin";
+  const checkForUpdates = () => void checkForUpdatesFromMenu();
   const template: MenuItemConstructorOptions[] = [
     ...(isMac
       ? [{
           label: app.name,
           submenu: [
             { role: "about" },
+            { label: "Check for Updates...", click: checkForUpdates },
             { type: "separator" },
             { role: "services" },
             { type: "separator" },
@@ -80,6 +83,8 @@ function installApplicationMenu(): void {
     {
       role: "help",
       submenu: [
+        ...(!isMac ? [{ label: "Check for Updates...", click: checkForUpdates } satisfies MenuItemConstructorOptions] : []),
+        ...(!isMac ? [{ type: "separator" } satisfies MenuItemConstructorOptions] : []),
         {
           label: "DinoRip on GitHub",
           click: () => void shell.openExternal("https://github.com/maria-rcks/dinorip")
@@ -88,6 +93,14 @@ function installApplicationMenu(): void {
     }
   ];
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
+
+function configureAboutPanel(): void {
+  app.setAboutPanelOptions({
+    applicationName: "DinoRip",
+    applicationVersion: app.getVersion(),
+    iconPath: appIconPath()
+  });
 }
 
 // The runtime/Dock icon uses the pre-rounded squircle: macOS does not
@@ -202,6 +215,8 @@ app.whenReady().then(async () => {
   // Register IPC once for the app lifetime; handlers resolve the current window
   // lazily, so re-creating the window on macOS does not double-register.
   registerIpc(() => mainWindow);
+  configureUpdates(() => mainWindow);
+  configureAboutPanel();
   installApplicationMenu();
   createWindow();
 

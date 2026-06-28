@@ -21,7 +21,11 @@ const CHANNELS = {
   saveProject: "dinorip:save-project",
   openProject: "dinorip:open-project",
   toggleFullscreen: "dinorip:toggle-fullscreen",
-  menuCommand: "dinorip:menu-command"
+  menuCommand: "dinorip:menu-command",
+  updateState: "dinorip:update-state",
+  getUpdateState: "dinorip:get-update-state",
+  checkForUpdate: "dinorip:check-for-update",
+  openUpdatePage: "dinorip:open-update-page"
 } as const satisfies typeof Contracts.IPC_CHANNELS;
 
 const api: DinoripApi = {
@@ -36,7 +40,15 @@ const api: DinoripApi = {
     ipcRenderer.on(CHANNELS.menuCommand, listener);
     return () => ipcRenderer.removeListener(CHANNELS.menuCommand, listener);
   },
-  toggleFullscreen: () => ipcRenderer.invoke(CHANNELS.toggleFullscreen)
+  toggleFullscreen: () => ipcRenderer.invoke(CHANNELS.toggleFullscreen),
+  getUpdateState: () => ipcRenderer.invoke(CHANNELS.getUpdateState),
+  checkForUpdate: () => ipcRenderer.invoke(CHANNELS.checkForUpdate),
+  openUpdatePage: () => ipcRenderer.invoke(CHANNELS.openUpdatePage),
+  onUpdateState: (handler) => {
+    const listener = (_event: Electron.IpcRendererEvent, state: Contracts.UpdateState) => handler(state);
+    ipcRenderer.on(CHANNELS.updateState, listener);
+    return () => ipcRenderer.removeListener(CHANNELS.updateState, listener);
+  }
 };
 
 contextBridge.exposeInMainWorld("dinorip", api);
