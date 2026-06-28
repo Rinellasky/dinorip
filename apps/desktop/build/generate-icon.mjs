@@ -1,11 +1,11 @@
-// Generates the DinoRip app icons from the pixel mark.
+// Generates the DinoRip app icons from the checked-in Icon Composer mark.
 //
 // macOS 26+ (Tahoe / Liquid Glass): the system supplies the squircle shape,
 // depth, shadow, and glass lighting at render time, so we ship FLAT layers and
 // let the OS do the rest. We emit a `.icon` bundle (Icon Composer format):
 //   icon.icon/
-//     icon.json            -> solid background fill + the mark as a glass layer
-//     Assets/foreground.png-> olive mark on transparent, no baked effects
+//     icon.json        -> app icon recipe exported from Icon Composer
+//     Assets/green.svg -> dino mark layer, no baked effects
 // electron-builder compiles this via `actool` (needs Xcode 26+) into Assets.car
 // and auto-generates a legacy .icns fallback for older macOS.
 //
@@ -20,65 +20,84 @@ import path from "node:path";
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 const SIZE = 1024;
-const OLIVE = "#7A8C5A";
 const BROWN = "#2E2A26"; // sRGB 0.18039, 0.16471, 0.14902
-const CONTENT = 0.64;    // mark occupies ~64% of the canvas; rest is breathing room
+const MARK_SCALE = 1.33;
+const MARK_SIZE = Math.round(512 * MARK_SCALE);
+const ICON_DIR = path.join(DIR, "icon.icon");
+const MARK_FILE = path.join(ICON_DIR, "Assets", "green.svg");
 
-// Olive cells of the original 8x8 mark (bounding box cols 1..6 / rows 1..6).
-// The internal gaps stay transparent so the background shows through (the
-// notch in the mark), exactly like the source logo.
-const CELLS = [
-  [1, 1], [2, 1], [3, 1], [4, 1], [5, 1], [6, 1],
-  [1, 2], [3, 2], [4, 2], [5, 2], [6, 2],
-  [1, 3], [3, 3], [4, 3], [5, 3], [6, 3],
-  [1, 4], [2, 4], [3, 4], [4, 4], [5, 4], [6, 4],
-  [1, 5], [2, 5], [3, 5], [4, 5], [5, 5], [6, 5],
-  [1, 6], [2, 6]
-];
-
-function markRects(fill) {
-  const mark = SIZE * CONTENT;
-  const cell = mark / 6;
-  const origin = (SIZE - mark) / 2;
-  const b = 0.6; // bleed so cells fuse into one silhouette (no AA seams)
-  return CELLS.map(([gx, gy]) => {
-    const x = origin + (gx - 1) * cell;
-    const y = origin + (gy - 1) * cell;
-    return `<rect x="${x - b}" y="${y - b}" width="${cell + 2 * b}" height="${cell + 2 * b}" fill="${fill}"/>`;
-  }).join("");
-}
-
-function svg(background) {
-  const bg = background ? `<rect width="${SIZE}" height="${SIZE}" fill="${background}"/>` : "";
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${SIZE}" height="${SIZE}" viewBox="0 0 ${SIZE} ${SIZE}">${bg}${markRects(OLIVE)}</svg>`;
+async function markPng(size = MARK_SIZE) {
+  return sharp(MARK_FILE)
+    .resize(size, size, { fit: "contain" })
+    .png()
+    .toBuffer();
 }
 
 async function png(file, background) {
-  await sharp(Buffer.from(svg(background))).png().toFile(path.join(DIR, file));
+  const mark = await markPng();
+  const inset = Math.round((SIZE - MARK_SIZE) / 2);
+  await sharp({
+    create: {
+      width: SIZE,
+      height: SIZE,
+      channels: 4,
+      background
+    }
+  })
+    .composite([{ input: mark, left: inset, top: inset }])
+    .png()
+    .toFile(path.join(DIR, file));
   console.log("Wrote", file);
 }
 
-// 1) macOS Liquid Glass .icon bundle (flat foreground layer, no baked effects).
-const iconDir = path.join(DIR, "icon.icon");
-fs.mkdirSync(path.join(iconDir, "Assets"), { recursive: true });
-await sharp(Buffer.from(svg(null)))
-  .png()
-  .toFile(path.join(iconDir, "Assets", "foreground.png"));
+// 1) macOS Liquid Glass .icon bundle.
+fs.mkdirSync(path.join(ICON_DIR, "Assets"), { recursive: true });
+if (!fs.existsSync(MARK_FILE)) {
+  throw new Error(`Missing ${path.relative(DIR, MARK_FILE)}. Copy the Icon Composer mark into build/icon.icon/Assets first.`);
+}
 
 const iconJson = {
-  fill: { solid: "srgb:0.18039,0.16471,0.14902,1.00000" }, // #2E2A26 background
+  fill: { "automatic-gradient": "display-p3:0.17810,0.16711,0.15479,1.00000" },
   groups: [
     {
-      layers: [{ "image-name": "foreground.png", name: "mark", glass: true }],
-      shadow: { kind: "neutral", opacity: 0.5 },
-      specular: true,
-      translucency: { enabled: true, value: 0.5 }
+      layers: [],
+      shadow: { kind: "neutral", opacity: 0.6 },
+      translucency: { enabled: true, value: 0.2 }
+    },
+    {
+      layers: [{
+        "blend-mode": "normal",
+        fill: {
+          "linear-gradient": [
+            "display-p3:0.52157,0.61176,0.33725,1.00000",
+            "srgb:0.47843,0.54902,0.35294,1.00000"
+          ],
+          orientation: {
+            start: { x: 0.4999999999999999, y: 0.2598465306348067 },
+            stop: { x: 0.5, y: 1 }
+          }
+        },
+        glass: true,
+        hidden: false,
+        "image-name": "green.svg",
+        name: "green",
+        opacity: 1,
+        position: {
+          scale: MARK_SCALE,
+          "translation-in-points": [0, 0]
+        }
+      }],
+      shadow: { kind: "neutral", opacity: 0.6 },
+      translucency: { enabled: true, value: 0.2 }
     }
   ],
-  "supported-platforms": { squares: ["iOS", "macOS"] }
+  "supported-platforms": {
+    circles: ["watchOS"],
+    squares: "shared"
+  }
 };
-fs.writeFileSync(path.join(iconDir, "icon.json"), JSON.stringify(iconJson, null, 2) + "\n");
-console.log("Wrote icon.icon/ (icon.json + Assets/foreground.png)");
+fs.writeFileSync(path.join(ICON_DIR, "icon.json"), JSON.stringify(iconJson, null, 2) + "\n");
+console.log("Wrote icon.icon/icon.json");
 
 // 2) Flat raster for Windows / Linux + the legacy macOS .icns fallback.
 await png("icon.png", BROWN);
@@ -90,12 +109,9 @@ await png("icon.png", BROWN);
 //   - shape: continuous-corner SUPERELLIPSE (n=5) sized to 80.5% of the canvas
 //     (Apple's 824-on-1024 grid). The Dock scales the whole canvas into the
 //     tile, so this ~9.8% gutter is what makes the icon the same size as its
-//     neighbours. The gutter stays transparent (no baked outer shadow — the
+//     neighbours. The gutter stays transparent (no baked outer shadow; the
 //     Dock adds its own; a baked one fills the gutter and reads as a grey frame).
-//   - background: ONE smooth top-lit gradient (no stacked radial/floor layers,
-//     which produced visible seams), finished with fine noise dithering to kill
-//     8-bit banding in the dark tones.
-//   - thin warm rim light on the top edge; foreground mark lifted with a shadow.
+//   - background: flat brand brown with a thin warm rim light on the top edge.
 const SQ_R = (SIZE * 0.805) / 2;
 
 // Continuous-corner squircle as a sampled superellipse |x|^n + |y|^n = 1.
@@ -118,15 +134,6 @@ const SQ = superellipsePath(C, C, SQ_R, SQ_R);
 
 function roundedSvg() {
   const rim = superellipsePath(C, C, SQ_R - 4, SQ_R - 4); // inset for top edge light
-  const mark = SIZE * 0.4; // ~50% of the 80.5% panel, with padding
-  const cell = mark / 6;
-  const origin = (SIZE - mark) / 2;
-  const b = 0.6; // bleed so adjacent cells fuse into one silhouette (no AA seams)
-  const cells = CELLS.map(([gx, gy]) => {
-    const x = origin + (gx - 1) * cell;
-    const y = origin + (gy - 1) * cell;
-    return `<rect x="${x - b}" y="${y - b}" width="${cell + 2 * b}" height="${cell + 2 * b}" fill="${OLIVE}"/>`;
-  }).join("");
 
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${SIZE}" height="${SIZE}" viewBox="0 0 ${SIZE} ${SIZE}">
     <defs>
@@ -136,16 +143,16 @@ function roundedSvg() {
         <stop offset="0.16" stop-color="#fff7ea" stop-opacity="0.07"/>
         <stop offset="0.36" stop-color="#fff7ea" stop-opacity="0"/>
       </linearGradient>
-      <filter id="lift" x="-30%" y="-30%" width="160%" height="160%">
-        <feDropShadow dx="0" dy="6" stdDev="9" flood-color="#000000" flood-opacity="0.28"/>
-      </filter>
-      <clipPath id="clip"><path d="${SQ}"/></clipPath>
     </defs>
     <path d="${SQ}" fill="${BROWN}"/>
-    <g clip-path="url(#clip)"><g filter="url(#lift)">${cells}</g></g>
     <path d="${rim}" fill="none" stroke="url(#rim)" stroke-width="3"/>
   </svg>`;
 }
 
-await sharp(Buffer.from(roundedSvg())).png().toFile(path.join(DIR, "icon-rounded.png"));
+const roundedMark = await markPng(MARK_SIZE);
+const roundedInset = Math.round((SIZE - MARK_SIZE) / 2);
+await sharp(Buffer.from(roundedSvg()))
+  .composite([{ input: roundedMark, left: roundedInset, top: roundedInset }])
+  .png()
+  .toFile(path.join(DIR, "icon-rounded.png"));
 console.log("Wrote icon-rounded.png");

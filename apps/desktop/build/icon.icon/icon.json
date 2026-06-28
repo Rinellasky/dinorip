@@ -1,31 +1,67 @@
 {
   "fill": {
-    "solid": "srgb:0.18039,0.16471,0.14902,1.00000"
+    "automatic-gradient": "display-p3:0.17810,0.16711,0.15479,1.00000"
   },
   "groups": [
     {
+      "layers": [],
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.6
+      },
+      "translucency": {
+        "enabled": true,
+        "value": 0.2
+      }
+    },
+    {
       "layers": [
         {
-          "image-name": "foreground.png",
-          "name": "mark",
-          "glass": true
+          "blend-mode": "normal",
+          "fill": {
+            "linear-gradient": [
+              "display-p3:0.52157,0.61176,0.33725,1.00000",
+              "srgb:0.47843,0.54902,0.35294,1.00000"
+            ],
+            "orientation": {
+              "start": {
+                "x": 0.4999999999999999,
+                "y": 0.2598465306348067
+              },
+              "stop": {
+                "x": 0.5,
+                "y": 1
+              }
+            }
+          },
+          "glass": true,
+          "hidden": false,
+          "image-name": "green.svg",
+          "name": "green",
+          "opacity": 1,
+          "position": {
+            "scale": 1.33,
+            "translation-in-points": [
+              0,
+              0
+            ]
+          }
         }
       ],
       "shadow": {
         "kind": "neutral",
-        "opacity": 0.5
+        "opacity": 0.6
       },
-      "specular": true,
       "translucency": {
         "enabled": true,
-        "value": 0.5
+        "value": 0.2
       }
     }
   ],
   "supported-platforms": {
-    "squares": [
-      "iOS",
-      "macOS"
-    ]
+    "circles": [
+      "watchOS"
+    ],
+    "squares": "shared"
   }
 }
